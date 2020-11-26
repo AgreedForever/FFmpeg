@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "libavutil/mathematics.h"
+#include "libavutil/thread.h"
 #include "fft.h"
 #include "fft-internal.h"
 
@@ -52,6 +53,66 @@ COSTABLE(16384);
 COSTABLE(32768);
 COSTABLE(65536);
 COSTABLE(131072);
+
+static av_cold void init_ff_cos_tabs(int index)
+{
+    int i;
+    int m = 1<<index;
+    double freq = 2*M_PI/m;
+    FFTSample *tab = FFT_NAME(ff_cos_tabs)[index];
+    for(i=0; i<=m/4; i++)
+        tab[i] = FIX15(cos(i*freq));
+    for(i=1; i<m/4; i++)
+        tab[m/2-i] = tab[i];
+}
+
+typedef struct CosTabsInitOnce {
+    void (*func)(void);
+    AVOnce control;
+} CosTabsInitOnce;
+
+#define INIT_FF_COS_TABS_FUNC(index, size)          \
+static av_cold void init_ff_cos_tabs_ ## size (void)\
+{                                                   \
+    init_ff_cos_tabs(index);                        \
+}
+
+INIT_FF_COS_TABS_FUNC(4, 16)
+INIT_FF_COS_TABS_FUNC(5, 32)
+INIT_FF_COS_TABS_FUNC(6, 64)
+INIT_FF_COS_TABS_FUNC(7, 128)
+INIT_FF_COS_TABS_FUNC(8, 256)
+INIT_FF_COS_TABS_FUNC(9, 512)
+INIT_FF_COS_TABS_FUNC(10, 1024)
+INIT_FF_COS_TABS_FUNC(11, 2048)
+INIT_FF_COS_TABS_FUNC(12, 4096)
+INIT_FF_COS_TABS_FUNC(13, 8192)
+INIT_FF_COS_TABS_FUNC(14, 16384)
+INIT_FF_COS_TABS_FUNC(15, 32768)
+INIT_FF_COS_TABS_FUNC(16, 65536)
+INIT_FF_COS_TABS_FUNC(17, 131072)
+
+static CosTabsInitOnce cos_tabs_init_once[] = {
+    { NULL },
+    { NULL },
+    { NULL },
+    { NULL },
+    { init_ff_cos_tabs_16, AV_ONCE_INIT },
+    { init_ff_cos_tabs_32, AV_ONCE_INIT },
+    { init_ff_cos_tabs_64, AV_ONCE_INIT },
+    { init_ff_cos_tabs_128, AV_ONCE_INIT },
+    { init_ff_cos_tabs_256, AV_ONCE_INIT },
+    { init_ff_cos_tabs_512, AV_ONCE_INIT },
+    { init_ff_cos_tabs_1024, AV_ONCE_INIT },
+    { init_ff_cos_tabs_2048, AV_ONCE_INIT },
+    { init_ff_cos_tabs_4096, AV_ONCE_INIT },
+    { init_ff_cos_tabs_8192, AV_ONCE_INIT },
+    { init_ff_cos_tabs_16384, AV_ONCE_INIT },
+    { init_ff_cos_tabs_32768, AV_ONCE_INIT },
+    { init_ff_cos_tabs_65536, AV_ONCE_INIT },
+    { init_ff_cos_tabs_131072, AV_ONCE_INIT },
+};
+
 #endif
 COSTABLE_CONST FFTSample * const FFT_NAME(ff_cos_tabs)[] = {
     NULL, NULL, NULL, NULL,
@@ -90,14 +151,7 @@ static int split_radix_permutation(int i, int n, int inverse)
 av_cold void ff_init_ff_cos_tabs(int index)
 {
 #if (!CONFIG_HARDCODED_TABLES) && (!FFT_FIXED_32)
-    int i;
-    int m = 1<<index;
-    double freq = 2*M_PI/m;
-    FFTSample *tab = FFT_NAME(ff_cos_tabs)[index];
-    for(i=0; i<=m/4; i++)
-        tab[i] = FIX15(cos(i*freq));
-    for(i=1; i<m/4; i++)
-        tab[m/2-i] = tab[i];
+    ff_thread_once(&cos_tabs_init_once[index].control, cos_tabs_init_once[index].func);
 #endif
 }
 
@@ -175,10 +229,7 @@ av_cold int ff_fft_init(FFTContext *s, int nbits, int inverse)
 #endif
 
 #if FFT_FIXED_32
-    {
-        int n=0;
-        ff_fft_lut_init(ff_fft_offsets_lut, 0, 1 << 17, &n);
-    }
+    ff_fft_lut_init();
 #else /* FFT_FIXED_32 */
 #if FFT_FLOAT
     if (ARCH_AARCH64) ff_fft_init_aarch64(s);
@@ -200,17 +251,41 @@ av_cold int ff_fft_init(FFTContext *s, int nbits, int inverse)
     if (s->fft_permutation == FF_FFT_PERM_AVX) {
         fft_perm_avx(s);
     } else {
-        for(i=0; i<n; i++) {
-            int k;
-            j = i;
-            if (s->fft_permutation == FF_FFT_PERM_SWAP_LSBS)
-                j = (j&~3) | ((j>>1)&1) | ((j<<1)&2);
-            k = -split_radix_permutation(i, n, s->inverse) & (n-1);
-            if (s->revtab)
-                s->revtab[k] = j;
-            if (s->revtab32)
-                s->revtab32[k] = j;
-        }
+#define PROCESS_FFT_PERM_SWAP_LSBS(num) do {\
+    for(i = 0; i < n; i++) {\
+        int k;\
+        j = i;\
+        j = (j & ~3) | ((j >> 1) & 1) | ((j << 1) & 2);\
+        k = -split_radix_permutation(i, n, s->inverse) & (n - 1);\
+        s->revtab##num[k] = j;\
+    } \
+} while(0);
+
+#define PROCESS_FFT_PERM_DEFAULT(num) do {\
+    for(i = 0; i < n; i++) {\
+        int k;\
+        j = i;\
+        k = -split_radix_permutation(i, n, s->inverse) & (n - 1);\
+        s->revtab##num[k] = j;\
+    } \
+} while(0);
+
+#define SPLIT_RADIX_PERMUTATION(num) do { \
+    if (s->fft_permutation == FF_FFT_PERM_SWAP_LSBS) {\
+        PROCESS_FFT_PERM_SWAP_LSBS(num) \
+    } else {\
+        PROCESS_FFT_PERM_DEFAULT(num) \
+    }\
+} while(0);
+
+    if (s->revtab)
+        SPLIT_RADIX_PERMUTATION()
+    if (s->revtab32)
+        SPLIT_RADIX_PERMUTATION(32)
+
+#undef PROCESS_FFT_PERM_DEFAULT
+#undef PROCESS_FFT_PERM_SWAP_LSBS
+#undef SPLIT_RADIX_PERMUTATION
     }
 
     return 0;
@@ -462,9 +537,11 @@ static void name(FFTComplex *z, const FFTSample *wre, unsigned int n)\
 }
 
 PASS(pass)
+#if !CONFIG_SMALL
 #undef BUTTERFLIES
 #define BUTTERFLIES BUTTERFLIES_BIG
 PASS(pass_big)
+#endif
 
 #define DECL_FFT(n,n2,n4)\
 static void fft##n(FFTComplex *z)\

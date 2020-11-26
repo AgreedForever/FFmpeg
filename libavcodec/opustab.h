@@ -31,6 +31,9 @@ extern const uint8_t  ff_celt_band_end[];
 
 extern const uint8_t  ff_opus_default_coupled_streams[];
 
+extern const uint16_t ff_silk_model_lbrr_flags_40[];
+extern const uint16_t ff_silk_model_lbrr_flags_60[];
+
 extern const uint16_t ff_silk_model_stereo_s1[];
 extern const uint16_t ff_silk_model_stereo_s2[];
 extern const uint16_t ff_silk_model_stereo_s3[];
@@ -151,9 +154,10 @@ extern const uint8_t  ff_celt_hadamard_order[];
 extern const uint16_t ff_celt_qn_exp2[];
 extern const uint32_t ff_celt_pvq_u[1272];
 
-extern const float    ff_celt_window2[120];
+extern const float    ff_celt_postfilter_taps[3][3];
 
-DECLARE_ALIGNED(32, extern const float, ff_celt_window)[120];
+extern const float    ff_celt_window2[120];
+extern const float   *ff_celt_window;
 
 extern const uint32_t * const ff_celt_pvq_u_row[15];
 

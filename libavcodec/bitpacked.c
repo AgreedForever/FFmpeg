@@ -68,10 +68,6 @@ static int bitpacked_decode_yuv422p10(AVCodecContext *avctx, AVFrame *frame,
     if (ret < 0)
         return ret;
 
-    y = (uint16_t*)frame->data[0];
-    u = (uint16_t*)frame->data[1];
-    v = (uint16_t*)frame->data[2];
-
     if (frame_size > packet_size)
         return AVERROR_INVALIDDATA;
 
@@ -150,4 +146,8 @@ AVCodec ff_bitpacked_decoder = {
     .init = bitpacked_init_decoder,
     .decode = bitpacked_decode,
     .capabilities = AV_CODEC_CAP_EXPERIMENTAL,
+    .codec_tags     = (const uint32_t []){
+        MKTAG('U', 'Y', 'V', 'Y'),
+        FF_CODEC_TAGS_END,
+    },
 };

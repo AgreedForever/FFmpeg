@@ -176,8 +176,8 @@ static void set_sample_rate_params(AVCodecContext *avctx)
     } else {
         shift = 0;
     }
-    s->uval           = FFALIGN(avctx->sample_rate + 511 >> 9, 4) << shift;
-    s->subframe_scale = FFALIGN(avctx->sample_rate + 511 >> 9, 4) << 1;
+    s->uval           = FFALIGN(avctx->sample_rate + 511LL >> 9, 4) << shift;
+    s->subframe_scale = FFALIGN(avctx->sample_rate + 511LL >> 9, 4) << 1;
 }
 
 static av_cold int tak_decode_init(AVCodecContext *avctx)
@@ -206,7 +206,7 @@ static void decode_lpc(int32_t *coeffs, int mode, int length)
         unsigned a1 = *coeffs++;
         for (i = 0; i < length - 1 >> 1; i++) {
             *coeffs   += a1;
-            coeffs[1] += *coeffs;
+            coeffs[1] += (unsigned)*coeffs;
             a1         = coeffs[1];
             coeffs    += 2;
         }
@@ -483,15 +483,15 @@ static int decode_subframe(TAKDecContext *s, int32_t *decoded,
             int v = 1 << (filter_quant - 1);
 
             if (filter_order & -16)
-                v += s->adsp.scalarproduct_int16(&s->residues[i], s->filter,
+                v += (unsigned)s->adsp.scalarproduct_int16(&s->residues[i], s->filter,
                                                  filter_order & -16);
             for (j = filter_order & -16; j < filter_order; j += 4) {
-                v += s->residues[i + j + 3] * s->filter[j + 3] +
-                     s->residues[i + j + 2] * s->filter[j + 2] +
-                     s->residues[i + j + 1] * s->filter[j + 1] +
-                     s->residues[i + j    ] * s->filter[j    ];
+                v += s->residues[i + j + 3] * (unsigned)s->filter[j + 3] +
+                     s->residues[i + j + 2] * (unsigned)s->filter[j + 2] +
+                     s->residues[i + j + 1] * (unsigned)s->filter[j + 1] +
+                     s->residues[i + j    ] * (unsigned)s->filter[j    ];
             }
-            v = (av_clip_intp2(v >> filter_quant, 13) * (1 << dshift)) - *decoded;
+            v = (av_clip_intp2(v >> filter_quant, 13) * (1 << dshift)) - (unsigned)*decoded;
             *decoded++ = v;
             s->residues[filter_order + i] = v >> dshift;
         }
@@ -653,7 +653,7 @@ static int decorrelate(TAKDecContext *s, int c1, int c2, int length)
                          s->residues[i    ] * s->filter[0];
                 }
 
-                v = av_clip_intp2(v >> 10, 13) * (1 << dshift) - *p1;
+                v = av_clip_intp2(v >> 10, 13) * (1U << dshift) - *p1;
                 *p1++ = v;
             }
 
@@ -915,13 +915,6 @@ static int tak_decode_frame(AVCodecContext *avctx, void *data,
 }
 
 #if HAVE_THREADS
-static int init_thread_copy(AVCodecContext *avctx)
-{
-    TAKDecContext *s = avctx->priv_data;
-    s->avctx = avctx;
-    return 0;
-}
-
 static int update_thread_context(AVCodecContext *dst,
                                  const AVCodecContext *src)
 {
@@ -953,7 +946,6 @@ AVCodec ff_tak_decoder = {
     .init             = tak_decode_init,
     .close            = tak_decode_close,
     .decode           = tak_decode_frame,
-    .init_thread_copy = ONLY_IF_THREADS_ENABLED(init_thread_copy),
     .update_thread_context = ONLY_IF_THREADS_ENABLED(update_thread_context),
     .capabilities     = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
     .sample_fmts      = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_U8P,

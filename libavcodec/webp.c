@@ -33,10 +33,10 @@
  *
  * @author James Almer <jamrial@gmail.com>
  * Exif metadata
+ * ICC profile
  *
  * Unimplemented:
  *   - Animation
- *   - ICC profile
  *   - XMP metadata
  */
 
@@ -197,6 +197,7 @@ typedef struct WebPContext {
     uint8_t *alpha_data;                /* alpha chunk data */
     int alpha_data_size;                /* alpha chunk data size */
     int has_exif;                       /* set after an EXIF chunk has been processed */
+    int has_iccp;                       /* set after an ICCP chunk has been processed */
     int width;                          /* image width */
     int height;                         /* image height */
     int lossless;                       /* indicates lossless or lossy */
@@ -231,44 +232,6 @@ static void image_ctx_free(ImageContext *img)
     memset(img, 0, sizeof(*img));
 }
 
-
-/* Differs from get_vlc2() in the following ways:
- *   - codes are bit-reversed
- *   - assumes 8-bit table to make reversal simpler
- *   - assumes max depth of 2 since the max code length for WebP is 15
- */
-static av_always_inline int webp_get_vlc(GetBitContext *gb, VLC_TYPE (*table)[2])
-{
-    int n, nb_bits;
-    unsigned int index;
-    int code;
-
-    OPEN_READER(re, gb);
-    UPDATE_CACHE(re, gb);
-
-    index = SHOW_UBITS(re, gb, 8);
-    index = ff_reverse[index];
-    code  = table[index][0];
-    n     = table[index][1];
-
-    if (n < 0) {
-        LAST_SKIP_BITS(re, gb, 8);
-        UPDATE_CACHE(re, gb);
-
-        nb_bits = -n;
-
-        index = SHOW_UBITS(re, gb, nb_bits);
-        index = (ff_reverse[index] >> (8 - nb_bits)) + code;
-        code  = table[index][0];
-        n     = table[index][1];
-    }
-    SKIP_BITS(re, gb, n);
-
-    CLOSE_READER(re, gb);
-
-    return code;
-}
-
 static int huff_reader_get_symbol(HuffReader *r, GetBitContext *gb)
 {
     if (r->simple) {
@@ -277,10 +240,10 @@ static int huff_reader_get_symbol(HuffReader *r, GetBitContext *gb)
         else
             return r->simple_symbols[get_bits1(gb)];
     } else
-        return webp_get_vlc(gb, r->vlc.table);
+        return get_vlc2(gb, r->vlc.table, 8, 2);
 }
 
-static int huff_reader_build_canonical(HuffReader *r, int *code_lengths,
+static int huff_reader_build_canonical(HuffReader *r, const uint8_t *code_lengths,
                                        int alphabet_size)
 {
     int len = 0, sym, code = 0, ret;
@@ -331,7 +294,7 @@ static int huff_reader_build_canonical(HuffReader *r, int *code_lengths,
 
     ret = init_vlc(&r->vlc, 8, alphabet_size,
                    code_lengths, sizeof(*code_lengths), sizeof(*code_lengths),
-                   codes, sizeof(*codes), sizeof(*codes), 0);
+                   codes, sizeof(*codes), sizeof(*codes), INIT_VLC_OUTPUT_LE);
     if (ret < 0) {
         av_free(codes);
         return ret;
@@ -361,13 +324,12 @@ static int read_huffman_code_normal(WebPContext *s, HuffReader *hc,
                                     int alphabet_size)
 {
     HuffReader code_len_hc = { { 0 }, 0, 0, { 0 } };
-    int *code_lengths = NULL;
-    int code_length_code_lengths[NUM_CODE_LENGTH_CODES] = { 0 };
+    uint8_t *code_lengths;
+    uint8_t code_length_code_lengths[NUM_CODE_LENGTH_CODES] = { 0 };
     int i, symbol, max_symbol, prev_code_len, ret;
     int num_codes = 4 + get_bits(&s->gb, 4);
 
-    if (num_codes > NUM_CODE_LENGTH_CODES)
-        return AVERROR_INVALIDDATA;
+    av_assert1(num_codes <= NUM_CODE_LENGTH_CODES);
 
     for (i = 0; i < num_codes; i++)
         code_length_code_lengths[code_length_code_order[i]] = get_bits(&s->gb, 3);
@@ -375,9 +337,9 @@ static int read_huffman_code_normal(WebPContext *s, HuffReader *hc,
     ret = huff_reader_build_canonical(&code_len_hc, code_length_code_lengths,
                                       NUM_CODE_LENGTH_CODES);
     if (ret < 0)
-        goto finish;
+        return ret;
 
-    code_lengths = av_mallocz_array(alphabet_size, sizeof(*code_lengths));
+    code_lengths = av_mallocz(alphabet_size);
     if (!code_lengths) {
         ret = AVERROR(ENOMEM);
         goto finish;
@@ -1334,6 +1296,7 @@ static int vp8_lossy_decode_frame(AVCodecContext *avctx, AVFrame *p,
     if (!s->initialized) {
         ff_vp8_decode_init(avctx);
         s->initialized = 1;
+        s->v.actually_webp = 1;
     }
     avctx->pix_fmt = s->has_alpha ? AV_PIX_FMT_YUVA420P : AV_PIX_FMT_YUV420P;
     s->lossless = 0;
@@ -1381,6 +1344,7 @@ static int webp_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     *got_frame   = 0;
     s->has_alpha = 0;
     s->has_exif  = 0;
+    s->has_iccp  = 0;
     bytestream2_init(&gb, avpkt->data, avpkt->size);
 
     if (bytestream2_get_bytes_left(&gb) < 12)
@@ -1409,8 +1373,11 @@ static int webp_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             return AVERROR_INVALIDDATA;
         chunk_size += chunk_size & 1;
 
-        if (bytestream2_get_bytes_left(&gb) < chunk_size)
-            return AVERROR_INVALIDDATA;
+        if (bytestream2_get_bytes_left(&gb) < chunk_size) {
+           /* we seem to be running out of data, but it could also be that the
+              bitstream has trailing junk leading to bogus chunk_size. */
+            break;
+        }
 
         switch (chunk_type) {
         case MKTAG('V', 'P', '8', ' '):
@@ -1502,7 +1469,7 @@ static int webp_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             }
 
             bytestream2_seek(&exif_gb, ifd_offset, SEEK_SET);
-            if (avpriv_exif_decode_ifd(avctx, &exif_gb, le, 0, &exif_metadata) < 0) {
+            if (ff_exif_decode_ifd(avctx, &exif_gb, le, 0, &exif_metadata) < 0) {
                 av_log(avctx, AV_LOG_ERROR, "error decoding Exif data\n");
                 goto exif_end;
             }
@@ -1514,7 +1481,27 @@ exif_end:
             bytestream2_skip(&gb, chunk_size);
             break;
         }
-        case MKTAG('I', 'C', 'C', 'P'):
+        case MKTAG('I', 'C', 'C', 'P'): {
+            AVFrameSideData *sd;
+
+            if (s->has_iccp) {
+                av_log(avctx, AV_LOG_VERBOSE, "Ignoring extra ICCP chunk\n");
+                bytestream2_skip(&gb, chunk_size);
+                break;
+            }
+            if (!(vp8x_flags & VP8X_FLAG_ICC))
+                av_log(avctx, AV_LOG_WARNING,
+                       "ICCP chunk present, but ICC Profile bit not set in the "
+                       "VP8X header\n");
+
+            s->has_iccp = 1;
+            sd = av_frame_new_side_data(p, AV_FRAME_DATA_ICC_PROFILE, chunk_size);
+            if (!sd)
+                return AVERROR(ENOMEM);
+
+            bytestream2_get_buffer(&gb, sd->data, chunk_size);
+            break;
+        }
         case MKTAG('A', 'N', 'I', 'M'):
         case MKTAG('A', 'N', 'M', 'F'):
         case MKTAG('X', 'M', 'P', ' '):

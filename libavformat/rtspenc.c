@@ -34,7 +34,6 @@
 #include "libavutil/time.h"
 #include "url.h"
 
-#define SDP_MAX_SIZE 16384
 
 static const AVClass rtsp_muxer_class = {
     .class_name = "RTSP muxer",
@@ -50,6 +49,7 @@ int ff_rtsp_setup_output_streams(AVFormatContext *s, const char *addr)
     int i;
     char *sdp;
     AVFormatContext sdp_ctx, *ctx_array[1];
+    char url[1024];
 
     if (s->start_time_realtime == 0  ||  s->start_time_realtime == AV_NOPTS_VALUE)
         s->start_time_realtime = av_gettime();
@@ -71,7 +71,8 @@ int ff_rtsp_setup_output_streams(AVFormatContext *s, const char *addr)
      * flexible SDP creation interface.
      */
     sdp_ctx = *s;
-    ff_url_join(sdp_ctx.filename, sizeof(sdp_ctx.filename),
+    sdp_ctx.url = url;
+    ff_url_join(url, sizeof(url),
                 "rtsp", NULL, addr, -1, NULL);
     ctx_array[0] = &sdp_ctx;
     if (av_sdp_create(ctx_array, 1, sdp, SDP_MAX_SIZE)) {

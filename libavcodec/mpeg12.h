@@ -47,10 +47,6 @@ static inline int decode_dc(GetBitContext *gb, int component)
     } else {
         code = get_vlc2(gb, ff_dc_chroma_vlc.table, DC_VLC_BITS, 2);
     }
-    if (code < 0){
-        av_log(NULL, AV_LOG_ERROR, "invalid dc code at\n");
-        return 0xffff;
-    }
     if (code == 0) {
         diff = 0;
     } else {
@@ -72,5 +68,9 @@ void ff_mpeg1_encode_mb(MpegEncContext *s, int16_t block[8][64],
                         int motion_x, int motion_y);
 void ff_mpeg1_encode_init(MpegEncContext *s);
 void ff_mpeg1_encode_slice_header(MpegEncContext *s);
+
+void ff_mpeg12_find_best_frame_rate(AVRational frame_rate,
+                                    int *code, int *ext_n, int *ext_d,
+                                    int nonstandard);
 
 #endif /* AVCODEC_MPEG12_H */

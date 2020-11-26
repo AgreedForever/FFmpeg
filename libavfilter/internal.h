@@ -26,7 +26,6 @@
 
 #include "libavutil/internal.h"
 #include "avfilter.h"
-#include "avfiltergraph.h"
 #include "formats.h"
 #include "framepool.h"
 #include "framequeue.h"
@@ -34,6 +33,7 @@
 #include "version.h"
 #include "video.h"
 #include "libavcodec/avcodec.h"
+#include "libavcodec/internal.h"
 
 typedef struct AVFilterCommand {
     double time;                ///< time expressed in seconds
@@ -93,17 +93,6 @@ struct AVFilterPad {
     int (*filter_frame)(AVFilterLink *link, AVFrame *frame);
 
     /**
-     * Frame poll callback. This returns the number of immediately available
-     * samples. It should return a positive value if the next request_frame()
-     * is guaranteed to return one frame (with no delay).
-     *
-     * Defaults to just calling the source poll_frame() method.
-     *
-     * Output pads only.
-     */
-    int (*poll_frame)(AVFilterLink *link);
-
-    /**
      * Frame request callback. A call to this should result in some progress
      * towards producing output over the given link. This should return zero
      * on success, and another value on error.
@@ -127,14 +116,6 @@ struct AVFilterPad {
      * and another value on error.
      */
     int (*config_props)(AVFilterLink *link);
-
-    /**
-     * The filter expects a fifo to be inserted on its input link,
-     * typically because it has a delay.
-     *
-     * input pads only.
-     */
-    int needs_fifo;
 
     /**
      * The filter expects writable frames from its input link,
@@ -191,28 +172,6 @@ av_warn_unused_result
 int ff_parse_sample_rate(int *ret, const char *arg, void *log_ctx);
 
 /**
- * Parse a time base.
- *
- * @param ret unsigned AVRational pointer to where the value should be written
- * @param arg string to parse
- * @param log_ctx log context
- * @return >= 0 in case of success, a negative AVERROR code on error
- */
-av_warn_unused_result
-int ff_parse_time_base(AVRational *ret, const char *arg, void *log_ctx);
-
-/**
- * Parse a sample format name or a corresponding integer representation.
- *
- * @param ret integer pointer to where the value should be written
- * @param arg string to parse
- * @param log_ctx log context
- * @return >= 0 in case of success, a negative AVERROR code on error
- */
-av_warn_unused_result
-int ff_parse_sample_format(int *ret, const char *arg, void *log_ctx);
-
-/**
  * Parse a channel layout or a corresponding integer representation.
  *
  * @param ret 64bit integer pointer to where the value should be written.
@@ -245,15 +204,11 @@ void ff_avfilter_link_set_out_status(AVFilterLink *link, int status, int64_t pts
 
 void ff_command_queue_pop(AVFilterContext *filter);
 
+#define D2TS(d)      (isnan(d) ? AV_NOPTS_VALUE : (int64_t)(d))
+#define TS2D(ts)     ((ts) == AV_NOPTS_VALUE ? NAN : (double)(ts))
+#define TS2T(ts, tb) ((ts) == AV_NOPTS_VALUE ? NAN : (double)(ts) * av_q2d(tb))
+
 /* misc trace functions */
-
-/* #define FF_AVFILTER_TRACE */
-
-#ifdef FF_AVFILTER_TRACE
-#    define ff_tlog(pctx, ...) av_log(pctx, AV_LOG_DEBUG, __VA_ARGS__)
-#else
-#    define ff_tlog(pctx, ...) do { if (0) av_log(pctx, AV_LOG_DEBUG, __VA_ARGS__); } while (0)
-#endif
 
 #define FF_TPRINTF_START(ctx, func) ff_tlog(NULL, "%-16s: ", #func)
 
@@ -296,15 +251,6 @@ static inline int ff_insert_outpad(AVFilterContext *f, unsigned index,
     return ff_insert_pad(index, &f->nb_outputs, offsetof(AVFilterLink, srcpad),
                   &f->output_pads, &f->outputs, p);
 }
-
-/**
- * Poll a frame from the filter chain.
- *
- * @param  link the input link
- * @return the number of immediately available frames, a negative
- * number in case of error
- */
-int ff_poll_frame(AVFilterLink *link);
 
 /**
  * Request an input frame from the filter at the other end of the link.
@@ -418,5 +364,28 @@ static inline int ff_norm_qscale(int qscale, int type)
  * This number is always same or less than graph->nb_threads.
  */
 int ff_filter_get_nb_threads(AVFilterContext *ctx);
+
+/**
+ * Generic processing of user supplied commands that are set
+ * in the same way as the filter options.
+ */
+int ff_filter_process_command(AVFilterContext *ctx, const char *cmd,
+                              const char *arg, char *res, int res_len, int flags);
+
+/**
+ * Perform any additional setup required for hardware frames.
+ *
+ * link->hw_frames_ctx must be set before calling this function.
+ * Inside link->hw_frames_ctx, the fields format, sw_format, width and
+ * height must be set.  If dynamically allocated pools are not supported,
+ * then initial_pool_size must also be set, to the minimum hardware frame
+ * pool size necessary for the filter to work (taking into account any
+ * frames which need to stored for use in operations as appropriate).  If
+ * default_pool_size is nonzero, then it will be used as the pool size if
+ * no other modification takes place (this can be used to preserve
+ * compatibility).
+ */
+int ff_filter_init_hw_frames(AVFilterContext *avctx, AVFilterLink *link,
+                             int default_pool_size);
 
 #endif /* AVFILTER_INTERNAL_H */

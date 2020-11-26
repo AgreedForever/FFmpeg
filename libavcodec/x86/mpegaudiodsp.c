@@ -30,7 +30,7 @@
 static void imdct36_blocks_ ## CPU(float *out, float *buf, float *in, int count, int switch_point, int block_type);\
 void ff_imdct36_float_ ## CPU(float *out, float *buf, float *in, float *win);
 
-#if HAVE_YASM
+#if HAVE_X86ASM
 #if ARCH_X86_32
 DECL(sse)
 #endif
@@ -38,7 +38,7 @@ DECL(sse2)
 DECL(sse3)
 DECL(ssse3)
 DECL(avx)
-#endif /* HAVE_YASM */
+#endif /* HAVE_X86ASM */
 
 void ff_four_imdct36_float_sse(float *out, float *buf, float *in, float *win,
                                float *tmpbuf);
@@ -193,7 +193,7 @@ static void apply_window_mp3(float *in, float *win, int *unused, float *out,
 
 #endif /* HAVE_6REGS && HAVE_SSE_INLINE */
 
-#if HAVE_YASM
+#if HAVE_X86ASM
 #define DECL_IMDCT_BLOCKS(CPU1, CPU2)                                       \
 static void imdct36_blocks_ ## CPU1(float *out, float *buf, float *in,      \
                                int count, int switch_point, int block_type) \
@@ -237,12 +237,10 @@ DECL_IMDCT_BLOCKS(ssse3,sse)
 #if HAVE_AVX_EXTERNAL
 DECL_IMDCT_BLOCKS(avx,avx)
 #endif
-#endif /* HAVE_YASM */
+#endif /* HAVE_X86ASM */
 
-av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
+av_cold void ff_mpadsp_init_x86_tabs(void)
 {
-    av_unused int cpu_flags = av_get_cpu_flags();
-
     int i, j;
     for (j = 0; j < 4; j++) {
         for (i = 0; i < 40; i ++) {
@@ -256,6 +254,11 @@ av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
             mdct_win_sse[1][j][4*i + 3] = ff_mdct_win_float[j + 4][i];
         }
     }
+}
+
+av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
+{
+    av_unused int cpu_flags = av_get_cpu_flags();
 
 #if HAVE_6REGS && HAVE_SSE_INLINE
     if (INLINE_SSE(cpu_flags)) {
@@ -263,7 +266,7 @@ av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
     }
 #endif /* HAVE_SSE_INLINE */
 
-#if HAVE_YASM
+#if HAVE_X86ASM
 #if HAVE_SSE
 #if ARCH_X86_32
     if (EXTERNAL_SSE(cpu_flags)) {
@@ -285,5 +288,5 @@ av_cold void ff_mpadsp_init_x86(MPADSPContext *s)
         s->imdct36_blocks_float = imdct36_blocks_avx;
     }
 #endif
-#endif /* HAVE_YASM */
+#endif /* HAVE_X86ASM */
 }

@@ -71,7 +71,7 @@ static inline void smv_img_pnt(uint8_t *dst_data[4], uint8_t *src_data[4],
             src_linesizes[i], h, nlines);
     }
     if (desc->flags & AV_PIX_FMT_FLAG_PAL ||
-        desc->flags & AV_PIX_FMT_FLAG_PSEUDOPAL)
+        desc->flags & FF_PSEUDOPAL)
         dst_data[1] = src_data[1];
 }
 
@@ -79,14 +79,12 @@ static av_cold int smvjpeg_decode_end(AVCodecContext *avctx)
 {
     SMVJpegDecodeContext *s = avctx->priv_data;
     MJpegDecodeContext *jpg = &s->jpg;
-    int ret;
 
     jpg->picture_ptr = NULL;
     av_frame_free(&s->picture[0]);
     av_frame_free(&s->picture[1]);
-    ret = avcodec_close(s->avctx);
-    av_freep(&s->avctx);
-    return ret;
+    avcodec_free_context(&s->avctx);
+    return 0;
 }
 
 static av_cold int smvjpeg_decode_init(AVCodecContext *avctx)
@@ -193,7 +191,6 @@ static int smvjpeg_decode_frame(AVCodecContext *avctx, void *data, int *data_siz
         s->picture[1]->width         = avctx->width;
         s->picture[1]->height        = avctx->height;
         s->picture[1]->format        = avctx->pix_fmt;
-        /* ff_init_buffer_info(avctx, &s->picture[1]); */
         smv_img_pnt(s->picture[1]->data, mjpeg_data->data, mjpeg_data->linesize,
                     avctx->pix_fmt, avctx->width, avctx->height, cur_frame);
         for (i = 0; i < AV_NUM_DATA_POINTERS; i++)
