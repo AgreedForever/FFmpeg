@@ -20,9 +20,12 @@
  */
 
 #include "avformat.h"
+#include "libavutil/attributes.h"
 #include "mpegts.h"
 #include "internal.h"
+#include "mux.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/opt.h"
 
@@ -31,7 +34,7 @@
 static const AVOption options[] = {
     FF_RTP_FLAG_OPTS(RTPMuxContext, flags),
     { "payload_type", "Specify RTP payload type", offsetof(RTPMuxContext, payload_type), AV_OPT_TYPE_INT, {.i64 = -1 }, -1, 127, AV_OPT_FLAG_ENCODING_PARAM },
-    { "ssrc", "Stream identifier", offsetof(RTPMuxContext, ssrc), AV_OPT_TYPE_INT, { .i64 = 0 }, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM },
+    { "ssrc", "Stream identifier", offsetof(RTPMuxContext, ssrc), AV_OPT_TYPE_UINT, { .i64 = 0 }, 0, UINT32_MAX, AV_OPT_FLAG_ENCODING_PARAM },
     { "cname", "CNAME to include in RTCP SR packets", offsetof(RTPMuxContext, cname), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
     { "seq", "Starting sequence number", offsetof(RTPMuxContext, seq), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 65535, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL },
@@ -66,6 +69,7 @@ static int is_supported(enum AVCodecID id)
     case AV_CODEC_ID_PCM_S8:
     case AV_CODEC_ID_PCM_S16BE:
     case AV_CODEC_ID_PCM_S16LE:
+    case AV_CODEC_ID_PCM_S24BE:
     case AV_CODEC_ID_PCM_U16BE:
     case AV_CODEC_ID_PCM_U16LE:
     case AV_CODEC_ID_PCM_U8:
@@ -76,12 +80,17 @@ static int is_supported(enum AVCodecID id)
     case AV_CODEC_ID_THEORA:
     case AV_CODEC_ID_VP8:
     case AV_CODEC_ID_VP9:
+    case AV_CODEC_ID_AV1:
     case AV_CODEC_ID_ADPCM_G722:
     case AV_CODEC_ID_ADPCM_G726:
+    case AV_CODEC_ID_ADPCM_G726LE:
     case AV_CODEC_ID_ILBC:
     case AV_CODEC_ID_MJPEG:
     case AV_CODEC_ID_SPEEX:
     case AV_CODEC_ID_OPUS:
+    case AV_CODEC_ID_RAWVIDEO:
+    case AV_CODEC_ID_BITPACKED:
+    case AV_CODEC_ID_G728:
         return 1;
     default:
         return 0;
@@ -92,6 +101,7 @@ static int rtp_write_header(AVFormatContext *s1)
 {
     RTPMuxContext *s = s1->priv_data;
     int n, ret = AVERROR(EINVAL);
+    int payload_header_size = 0;
     AVStream *st;
 
     if (s1->nb_streams != 1) {
@@ -164,15 +174,24 @@ static int rtp_write_header(AVFormatContext *s1)
     case AV_CODEC_ID_MP2:
     case AV_CODEC_ID_MP3:
         s->buf_ptr = s->buf + 4;
+        payload_header_size = 4;
         avpriv_set_pts_info(st, 32, 1, 90000);
         break;
     case AV_CODEC_ID_MPEG1VIDEO:
     case AV_CODEC_ID_MPEG2VIDEO:
+        payload_header_size = 4;
         break;
     case AV_CODEC_ID_MPEG2TS:
+        if (s->max_payload_size < TS_PACKET_SIZE) {
+            av_log(s1, AV_LOG_ERROR,
+                   "RTP payload size %u too small for MPEG-TS "
+                   "(minimum %d bytes required)\n",
+                   s->max_payload_size, TS_PACKET_SIZE);
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+
         n = s->max_payload_size / TS_PACKET_SIZE;
-        if (n < 1)
-            n = 1;
         s->max_payload_size = n * TS_PACKET_SIZE;
         break;
     case AV_CODEC_ID_DIRAC:
@@ -185,6 +204,16 @@ static int rtp_write_header(AVFormatContext *s1)
             ret = AVERROR_EXPERIMENTAL;
             goto fail;
         }
+        payload_header_size = 20;
+        break;
+    case AV_CODEC_ID_H263:
+        if (s->flags & FF_RTP_FLAG_RFC2190) {
+            payload_header_size = 8;
+            break;
+        }
+        av_fallthrough;
+    case AV_CODEC_ID_H263P:
+        payload_header_size = 2;
         break;
     case AV_CODEC_ID_H261:
         if (s1->strict_std_compliance > FF_COMPLIANCE_EXPERIMENTAL) {
@@ -196,12 +225,14 @@ static int rtp_write_header(AVFormatContext *s1)
             ret = AVERROR_EXPERIMENTAL;
             goto fail;
         }
+        payload_header_size = 4;
         break;
     case AV_CODEC_ID_H264:
         /* check for H.264 MP4 syntax */
         if (st->codecpar->extradata_size > 4 && st->codecpar->extradata[0] == 1) {
             s->nal_length_size = (st->codecpar->extradata[4] & 0x03) + 1;
         }
+        payload_header_size = 2;
         break;
     case AV_CODEC_ID_HEVC:
         /* Only check for the standardized hvcC version of extradata, keeping
@@ -210,6 +241,24 @@ static int rtp_write_header(AVFormatContext *s1)
          * libavcodec/hevc.c). */
         if (st->codecpar->extradata_size > 21 && st->codecpar->extradata[0] == 1) {
             s->nal_length_size = (st->codecpar->extradata[21] & 0x03) + 1;
+        }
+        payload_header_size = 3;
+        break;
+    case AV_CODEC_ID_VP8:
+        payload_header_size = 4;
+        break;
+    case AV_CODEC_ID_BITPACKED:
+    case AV_CODEC_ID_RAWVIDEO:
+        if (st->codecpar->width > 32767 || st->codecpar->height > 32767) {
+            av_log(s1, AV_LOG_ERROR, "dimensions %dx%d too large for RFC 4175\n",
+                   st->codecpar->width, st->codecpar->height);
+            return AVERROR(EINVAL);
+        }
+        av_fallthrough;
+    case AV_CODEC_ID_MJPEG:
+        if (st->codecpar->width <= 0 || st->codecpar->height <= 0) {
+            av_log(s1, AV_LOG_ERROR, "dimensions not set\n");
+            return AVERROR(EINVAL);
         }
         break;
     case AV_CODEC_ID_VP9:
@@ -221,6 +270,18 @@ static int rtp_write_header(AVFormatContext *s1)
             ret = AVERROR_EXPERIMENTAL;
             goto fail;
         }
+        payload_header_size = 1;
+        break;
+    case AV_CODEC_ID_AV1:
+        if (s1->strict_std_compliance > FF_COMPLIANCE_EXPERIMENTAL) {
+            av_log(s, AV_LOG_ERROR,
+                   "Packetizing AV1 is experimental and its specification is "
+                   "still in draft state. "
+                   "Please set -strict experimental in order to enable it.\n");
+            ret = AVERROR_EXPERIMENTAL;
+            goto fail;
+        }
+        payload_header_size = 3;
         break;
     case AV_CODEC_ID_VORBIS:
     case AV_CODEC_ID_THEORA:
@@ -232,7 +293,7 @@ static int rtp_write_header(AVFormatContext *s1)
         avpriv_set_pts_info(st, 32, 1, 8000);
         break;
     case AV_CODEC_ID_OPUS:
-        if (st->codecpar->channels > 2) {
+        if (st->codecpar->ch_layout.nb_channels > 2) {
             av_log(s1, AV_LOG_ERROR, "Multistream opus not supported in RTP\n");
             goto fail;
         }
@@ -247,6 +308,10 @@ static int rtp_write_header(AVFormatContext *s1)
             goto fail;
         }
         s->max_frames_per_packet = s->max_payload_size / st->codecpar->block_align;
+        if (!s->max_frames_per_packet) {
+            av_log(s1, AV_LOG_ERROR, "RTP max payload size too small for iLBC\n");
+            goto fail;
+        }
         break;
     case AV_CODEC_ID_AMR_NB:
     case AV_CODEC_ID_AMR_WB:
@@ -260,16 +325,24 @@ static int rtp_write_header(AVFormatContext *s1)
             av_log(s1, AV_LOG_ERROR, "RTP max payload size too small for AMR\n");
             goto fail;
         }
-        if (st->codecpar->channels != 1) {
+        if (st->codecpar->ch_layout.nb_channels != 1) {
             av_log(s1, AV_LOG_ERROR, "Only mono is supported\n");
             goto fail;
         }
         break;
     case AV_CODEC_ID_AAC:
         s->max_frames_per_packet = 50;
+        if (!(s->flags & FF_RTP_FLAG_MP4A_LATM))
+            payload_header_size = 4;
         break;
     default:
         break;
+    }
+
+    if (s->max_payload_size <= payload_header_size) {
+        av_log(s1, AV_LOG_ERROR, "Max packet size %u too low for a %d byte payload header\n",
+               s1->packet_size, payload_header_size);
+        goto fail;
     }
 
     return 0;
@@ -344,6 +417,8 @@ void ff_rtp_send_data(AVFormatContext *s1, const uint8_t *buf1, int len, int m)
     avio_flush(s1->pb);
 
     s->seq = (s->seq + 1) & 0xffff;
+    if (!s->seq)
+        s->seq_high++;
     s->octet_count += len;
     s->packet_count++;
 }
@@ -359,6 +434,11 @@ static int rtp_send_samples(AVFormatContext *s1,
     int aligned_samples_size = sample_size_bits/av_gcd(sample_size_bits, 8);
 
     max_packet_size = (s->max_payload_size / aligned_samples_size) * aligned_samples_size;
+    if (!max_packet_size) {
+        av_log(s1, AV_LOG_ERROR, "RTP max payload size too small for %d byte samples\n",
+               aligned_samples_size);
+        return AVERROR(EINVAL);
+    }
     /* Not needed, but who knows. Don't check if samples aren't an even number of bytes. */
     if ((sample_size_bits % 8) == 0 && ((8 * size) % sample_size_bits) != 0)
         return AVERROR(EINVAL);
@@ -400,7 +480,7 @@ static void rtp_send_mpegaudio(AVFormatContext *s1,
     }
 
     /* add the packet */
-    if (size > max_packet_size) {
+    if (size > max_packet_size - 4) {
         /* big packet: fragment */
         count = 0;
         while (size > 0) {
@@ -537,21 +617,24 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
     case AV_CODEC_ID_PCM_ALAW:
     case AV_CODEC_ID_PCM_U8:
     case AV_CODEC_ID_PCM_S8:
-        return rtp_send_samples(s1, pkt->data, size, 8 * st->codecpar->channels);
+        return rtp_send_samples(s1, pkt->data, size, 8 * st->codecpar->ch_layout.nb_channels);
     case AV_CODEC_ID_PCM_U16BE:
     case AV_CODEC_ID_PCM_U16LE:
     case AV_CODEC_ID_PCM_S16BE:
     case AV_CODEC_ID_PCM_S16LE:
-        return rtp_send_samples(s1, pkt->data, size, 16 * st->codecpar->channels);
+        return rtp_send_samples(s1, pkt->data, size, 16 * st->codecpar->ch_layout.nb_channels);
+    case AV_CODEC_ID_PCM_S24BE:
+        return rtp_send_samples(s1, pkt->data, size, 24 * st->codecpar->ch_layout.nb_channels);
     case AV_CODEC_ID_ADPCM_G722:
         /* The actual sample size is half a byte per sample, but since the
          * stream clock rate is 8000 Hz while the sample rate is 16000 Hz,
          * the correct parameter for send_samples_bits is 8 bits per stream
          * clock. */
-        return rtp_send_samples(s1, pkt->data, size, 8 * st->codecpar->channels);
+        return rtp_send_samples(s1, pkt->data, size, 8 * st->codecpar->ch_layout.nb_channels);
     case AV_CODEC_ID_ADPCM_G726:
+    case AV_CODEC_ID_ADPCM_G726LE:
         return rtp_send_samples(s1, pkt->data, size,
-                                st->codecpar->bits_per_coded_sample * st->codecpar->channels);
+                                st->codecpar->bits_per_coded_sample * st->codecpar->ch_layout.nb_channels);
     case AV_CODEC_ID_MP2:
     case AV_CODEC_ID_MP3:
         rtp_send_mpegaudio(s1, pkt->data, size);
@@ -560,15 +643,30 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
     case AV_CODEC_ID_MPEG2VIDEO:
         ff_rtp_send_mpegvideo(s1, pkt->data, size);
         break;
-    case AV_CODEC_ID_AAC:
+    case AV_CODEC_ID_AAC: {
+        const uint8_t *aac_frame = pkt->data;
+
+        /* skip ADTS header, if present */
+        if (!st->codecpar->extradata_size) {
+            if (size < 7) {
+                av_log(s1, AV_LOG_ERROR, "AAC packet too small for ADTS header\n");
+                break;
+            }
+            aac_frame += 7;
+            size      -= 7;
+        }
         if (s->flags & FF_RTP_FLAG_MP4A_LATM)
-            ff_rtp_send_latm(s1, pkt->data, size);
+            ff_rtp_send_latm(s1, aac_frame, size);
         else
-            ff_rtp_send_aac(s1, pkt->data, size);
+            ff_rtp_send_aac(s1, aac_frame, size);
         break;
+    }
     case AV_CODEC_ID_AMR_NB:
     case AV_CODEC_ID_AMR_WB:
         ff_rtp_send_amr(s1, pkt->data, size);
+        break;
+    case AV_CODEC_ID_AV1:
+        ff_rtp_send_av1(s1, pkt->data, size, (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0);
         break;
     case AV_CODEC_ID_MPEG2TS:
         rtp_send_mpegts_raw(s1, pkt->data, size);
@@ -584,14 +682,14 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
         break;
     case AV_CODEC_ID_H263:
         if (s->flags & FF_RTP_FLAG_RFC2190) {
-            int mb_info_size = 0;
+            size_t mb_info_size;
             const uint8_t *mb_info =
                 av_packet_get_side_data(pkt, AV_PKT_DATA_H263_MB_INFO,
                                         &mb_info_size);
             ff_rtp_send_h263_rfc2190(s1, pkt->data, size, mb_info, mb_info_size);
             break;
         }
-        /* Fallthrough */
+        av_fallthrough;
     case AV_CODEC_ID_H263P:
         ff_rtp_send_h263(s1, pkt->data, size);
         break;
@@ -614,6 +712,15 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
     case AV_CODEC_ID_MJPEG:
         ff_rtp_send_jpeg(s1, pkt->data, size);
         break;
+    case AV_CODEC_ID_BITPACKED:
+    case AV_CODEC_ID_RAWVIDEO: {
+        int interlaced = st->codecpar->field_order != AV_FIELD_PROGRESSIVE;
+
+        ff_rtp_send_raw_rfc4175(s1, pkt->data, size, interlaced, 0);
+        if (interlaced)
+            ff_rtp_send_raw_rfc4175(s1, pkt->data, size, interlaced, 1);
+        break;
+        }
     case AV_CODEC_ID_OPUS:
         if (size > s->max_payload_size) {
             av_log(s1, AV_LOG_ERROR,
@@ -621,7 +728,7 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
                    size, s->max_payload_size);
             return AVERROR(EINVAL);
         }
-        /* Intentional fallthrough */
+        av_fallthrough;
     default:
         /* better than nothing : send the codec raw data */
         rtp_send_raw(s1, pkt->data, size);
@@ -638,20 +745,27 @@ static int rtp_write_trailer(AVFormatContext *s1)
      * be NULL here even if it was successfully allocated at the start. */
     if (s1->pb && (s->flags & FF_RTP_FLAG_SEND_BYE))
         rtcp_send_sr(s1, ff_ntp_time(), 1);
-    av_freep(&s->buf);
 
     return 0;
 }
 
-AVOutputFormat ff_rtp_muxer = {
-    .name              = "rtp",
-    .long_name         = NULL_IF_CONFIG_SMALL("RTP output"),
+static void rtp_deinit(AVFormatContext *s1)
+{
+    RTPMuxContext *s = s1->priv_data;
+
+    av_freep(&s->buf);
+}
+
+const FFOutputFormat ff_rtp_muxer = {
+    .p.name            = "rtp",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("RTP output"),
     .priv_data_size    = sizeof(RTPMuxContext),
-    .audio_codec       = AV_CODEC_ID_PCM_MULAW,
-    .video_codec       = AV_CODEC_ID_MPEG4,
+    .p.audio_codec     = AV_CODEC_ID_PCM_MULAW,
+    .p.video_codec     = AV_CODEC_ID_MPEG4,
     .write_header      = rtp_write_header,
     .write_packet      = rtp_write_packet,
     .write_trailer     = rtp_write_trailer,
-    .priv_class        = &rtp_muxer_class,
-    .flags             = AVFMT_TS_NONSTRICT,
+    .deinit            = rtp_deinit,
+    .p.priv_class      = &rtp_muxer_class,
+    .p.flags           = AVFMT_NODIMENSIONS | AVFMT_TS_NONSTRICT,
 };

@@ -26,7 +26,7 @@ static const uint8_t h263_loop_filter_strength_msa[32] = {
     7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12, 12
 };
 
-static void h263_h_loop_filter_msa(uint8_t *src, int32_t stride, int32_t qscale)
+static void h263_h_loop_filter_msa(uint8_t *src, ptrdiff_t stride, int32_t qscale)
 {
     int32_t strength = h263_loop_filter_strength_msa[qscale];
     v16u8 in0, in1, in2, in3, in4, in5, in6, in7;
@@ -86,13 +86,10 @@ static void h263_h_loop_filter_msa(uint8_t *src, int32_t stride, int32_t qscale)
     ILVR_B2_SH(in3, in0, in1, in2, temp0, temp1);
     in0 = (v16u8) __msa_ilvr_h(temp1, temp0);
     in3 = (v16u8) __msa_ilvl_h(temp1, temp0);
-    ST4x4_UB(in0, in0, 0, 1, 2, 3, src, stride);
-    src += 4 * stride;
-    ST4x4_UB(in3, in3, 0, 1, 2, 3, src, stride);
-    src += 4 * stride;
+    ST_W8(in0, in3, 0, 1, 2, 3, 0, 1, 2, 3, src, stride);
 }
 
-static void h263_v_loop_filter_msa(uint8_t *src, int32_t stride, int32_t qscale)
+static void h263_v_loop_filter_msa(uint8_t *src, ptrdiff_t stride, int32_t qscale)
 {
     int32_t strength = h263_loop_filter_strength_msa[qscale];
     uint64_t res0, res1, res2, res3;
@@ -153,12 +150,12 @@ static void h263_v_loop_filter_msa(uint8_t *src, int32_t stride, int32_t qscale)
     SD4(res0, res1, res2, res3, src, stride);
 }
 
-void ff_h263_h_loop_filter_msa(uint8_t *src, int32_t stride, int32_t q_scale)
+void ff_h263_h_loop_filter_msa(uint8_t *src, ptrdiff_t stride, int32_t q_scale)
 {
     h263_h_loop_filter_msa(src, stride, q_scale);
 }
 
-void ff_h263_v_loop_filter_msa(uint8_t *src, int32_t stride, int32_t q_scale)
+void ff_h263_v_loop_filter_msa(uint8_t *src, ptrdiff_t stride, int32_t q_scale)
 {
     h263_v_loop_filter_msa(src, stride, q_scale);
 }

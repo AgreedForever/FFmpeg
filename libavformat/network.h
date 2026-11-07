@@ -22,6 +22,7 @@
 #define AVFORMAT_NETWORK_H
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "config.h"
@@ -50,6 +51,9 @@
 #ifndef EINPROGRESS
 #define EINPROGRESS     WSAEINPROGRESS
 #endif
+#ifndef ENOTCONN
+#define ENOTCONN        WSAENOTCONN
+#endif
 
 #define getsockopt(a, b, c, d, e) getsockopt(a, b, c, (char*) d, e)
 #define setsockopt(a, b, c, d, e) setsockopt(a, b, c, (const char*) d, e)
@@ -59,6 +63,7 @@ int ff_neterrno(void);
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 
 #define ff_neterrno() AVERROR(errno)
@@ -74,7 +79,6 @@ int ff_neterrno(void);
 
 int ff_socket_nonblock(int socket, int enable);
 
-extern int ff_network_inited_globally;
 int ff_network_init(void);
 void ff_network_close(void);
 
@@ -87,15 +91,84 @@ int ff_network_wait_fd(int fd, int write);
  * This works similarly to ff_network_wait_fd, but waits up to 'timeout' microseconds
  * Uses ff_network_wait_fd in a loop
  *
- * @fd Socket descriptor
- * @write Set 1 to wait for socket able to be read, 0 to be written
- * @timeout Timeout interval, in microseconds. Actual precision is 100000 mcs, due to ff_network_wait_fd usage
+ * @param fd Socket descriptor
+ * @param write Set 1 to wait for socket able to be read, 0 to be written
+ * @param timeout Timeout interval, in microseconds. Actual precision is 100000 mcs, due to ff_network_wait_fd usage
  * @param int_cb Interrupt callback, is checked before each ff_network_wait_fd call
  * @return 0 if data can be read/written, AVERROR(ETIMEDOUT) if timeout expired, or negative error code
  */
 int ff_network_wait_fd_timeout(int fd, int write, int64_t timeout, AVIOInterruptCB *int_cb);
 
-int ff_inet_aton (const char * str, struct in_addr * add);
+/**
+ * Waits for up to 'timeout' microseconds. If the usert's int_cb is set and
+ * triggered, return before that.
+ * @param timeout Timeout in microseconds. Maybe have lower actual precision.
+ * @param int_cb Interrupt callback, is checked regularly.
+ * @return AVERROR(ETIMEDOUT) if timeout expirted, AVERROR_EXIT if interrupted by int_cb
+ */
+int ff_network_sleep_interruptible(int64_t timeout, AVIOInterruptCB *int_cb);
+
+/**
+ * A channel for waking a thread that is blocked in
+ * ff_network_wait_fd_wakeup(), from another thread.
+ *
+ * Usage: the waiting thread calls ff_network_wait_fd_wakeup(); another
+ * thread calls ff_network_wakeup_signal() to end that wait; once the
+ * waiting thread has been joined, ff_network_wakeup_close() is called.
+ *
+ * rfd is pollable together with sockets on every platform. It is an
+ * eventfd, the read end of a pipe, or a loopback datagram socket on
+ * Windows, where only sockets can be waited on together with sockets.
+ * wfd is the end ff_network_wakeup_signal() writes to; it equals rfd
+ * unless a pipe is in use. On systems other than Windows both fds are
+ * close-on-exec.
+ */
+typedef struct FFNetWakeup {
+    int rfd;
+    int wfd;
+    atomic_int signaled;
+} FFNetWakeup;
+
+/**
+ * Create a wakeup channel. On Windows ff_network_init() must have been
+ * called first.
+ *
+ * @return 0 on success, a negative AVERROR code on failure
+ */
+int ff_network_wakeup_open(FFNetWakeup *w);
+
+/**
+ * Wake the thread blocked in ff_network_wait_fd_wakeup() on this channel,
+ * or the next one that waits on it: the signal is not consumed, so a
+ * signal sent before the wait starts is not lost. Only the first call has
+ * an effect; the function may be called any number of times, from any
+ * thread.
+ *
+ * @return 0 on success, a negative AVERROR code if the first call failed
+ *         to write to the channel
+ */
+int ff_network_wakeup_signal(FFNetWakeup *w);
+
+/**
+ * Close the channel. Call it after the waiting thread has been joined and
+ * no thread can signal any more.
+ */
+void ff_network_wakeup_close(FFNetWakeup *w);
+
+/**
+ * Like ff_network_wait_fd(), but also returns as soon as the wakeup
+ * channel is signaled, and with a caller chosen timeout.
+ *
+ * @param fd Socket descriptor
+ * @param write Set 1 to wait for the socket to be writable, 0 for readable
+ * @param timeout_ms Timeout in milliseconds, or -1 to wait indefinitely
+ * @param w Wakeup channel to watch, must have been opened
+ * @return 0 if fd is ready, AVERROR(EAGAIN) if the timeout expired,
+ *         AVERROR_EXIT if w was signaled (also when fd is ready),
+ *         or a negative error code
+ */
+int ff_network_wait_fd_wakeup(int fd, int write, int timeout_ms,
+                              const FFNetWakeup *w);
 
 #if !HAVE_STRUCT_SOCKADDR_STORAGE
 struct sockaddr_storage {
@@ -261,7 +334,8 @@ int ff_listen_bind(int fd, const struct sockaddr *addr,
  * @param addrlen Third argument of bind().
  * @return        0 on success or an AVERROR on failure.
  */
-int ff_listen(int fd, const struct sockaddr *addr, socklen_t addrlen);
+int ff_listen(int fd, const struct sockaddr *addr, socklen_t addrlen,
+              void *logctx);
 
 /**
  * Poll for a single connection on the passed file descriptor.
@@ -295,6 +369,39 @@ int ff_listen_connect(int fd, const struct sockaddr *addr,
 
 int ff_http_match_no_proxy(const char *no_proxy, const char *hostname);
 
-int ff_socket(int domain, int type, int protocol);
+int ff_socket(int domain, int type, int protocol, void *logctx);
+
+void ff_log_net_error(void *ctx, int level, const char* prefix);
+
+/**
+ * Connect to any of the given addrinfo addresses, with multiple attempts
+ * running in parallel.
+ *
+ * @param addrs    The list of addresses to try to connect to.
+ *                 This list will be mutated internally, but the list head
+ *                 will remain as such, so this doesn't affect the caller
+ *                 freeing the list afterwards.
+ * @param timeout_ms_per_address The number of milliseconds to wait for each
+ *                 connection attempt. Since multiple addresses are tried,
+ *                 some of them in parallel, the total run time will at most
+ *                 be timeout_ms_per_address*ceil(nb_addrs/parallel) +
+ *                 (parallel - 1) * NEXT_ATTEMPT_DELAY_MS.
+ * @param parallel The maximum number of connections to attempt in parallel.
+ *                 This is limited to an internal maximum capacity.
+ * @param h        URLContext providing interrupt check
+ *                 callback and logging context.
+ * @param fd       If successful, the connected socket is returned here.
+ * @param customize_fd Function that will be called for each socket created,
+ *                 to allow the caller to set socket options before calling
+ *                 connect() on it, may be NULL.
+ * @param customize_ctx Context parameter passed to customize_fd.
+ * @return         0 on success, AVERROR on failure.
+ */
+int ff_connect_parallel(struct addrinfo *addrs, int timeout_ms_per_address,
+                        int parallel, URLContext *h, int *fd,
+                        int (*customize_fd)(void *, int, int), void *customize_ctx);
+
+void ff_udp_get_last_recv_addr(URLContext *h, struct sockaddr_storage *addr, socklen_t *addr_len);
+int ff_udp_set_remote_addr(URLContext *h, const struct sockaddr *dest_addr, socklen_t dest_addr_len, int do_connect);
 
 #endif /* AVFORMAT_NETWORK_H */

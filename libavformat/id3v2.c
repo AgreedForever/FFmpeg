@@ -27,20 +27,27 @@
  */
 
 #include "config.h"
+#include "libavutil/attributes.h"
 
 #if CONFIG_ZLIB
 #include <zlib.h>
 #endif
 
+#include "libavutil/attributes_internal.h"
 #include "libavutil/avstring.h"
+#include "libavutil/bprint.h"
 #include "libavutil/dict.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
+#include "libavcodec/png.h"
 #include "avio_internal.h"
-#include "internal.h"
+#include "avlanguage.h"
+#include "demux.h"
 #include "id3v1.h"
 #include "id3v2.h"
 
 const AVMetadataConv ff_id3v2_34_metadata_conv[] = {
+    { "COMM", "comment"      },
     { "TALB", "album"        },
     { "TCOM", "composer"     },
     { "TCON", "genre"        },
@@ -67,6 +74,8 @@ const AVMetadataConv ff_id3v2_4_metadata_conv[] = {
     { "TSOA", "album-sort"    },
     { "TSOP", "artist-sort"   },
     { "TSOT", "title-sort"    },
+    { "TSST", "disc_subtitle" },
+    { "TIT1", "grouping"      },
     { 0 }
 };
 
@@ -83,7 +92,7 @@ static const AVMetadataConv id3v2_2_metadata_conv[] = {
     { 0 }
 };
 
-const char ff_id3v2_tags[][4] = {
+attribute_nonstring const char ff_id3v2_tags[][4] = {
     "TALB", "TBPM", "TCOM", "TCON", "TCOP", "TDLY", "TENC", "TEXT",
     "TFLT", "TIT1", "TIT2", "TIT3", "TKEY", "TLAN", "TLEN", "TMED",
     "TOAL", "TOFN", "TOLY", "TOPE", "TOWN", "TPE1", "TPE2", "TPE3",
@@ -91,18 +100,18 @@ const char ff_id3v2_tags[][4] = {
     { 0 },
 };
 
-const char ff_id3v2_4_tags[][4] = {
+attribute_nonstring  const char ff_id3v2_4_tags[][4] = {
     "TDEN", "TDOR", "TDRC", "TDRL", "TDTG", "TIPL", "TMCL", "TMOO",
     "TPRO", "TSOA", "TSOP", "TSOT", "TSST",
     { 0 },
 };
 
-const char ff_id3v2_3_tags[][4] = {
+attribute_nonstring const char ff_id3v2_3_tags[][4] = {
     "TDAT", "TIME", "TORY", "TRDA", "TSIZ", "TYER",
     { 0 },
 };
 
-const char *ff_id3v2_picture_types[21] = {
+const char * const ff_id3v2_picture_types[21] = {
     "Other",
     "32x32 pixels 'file icon'",
     "Other file icon",
@@ -127,15 +136,17 @@ const char *ff_id3v2_picture_types[21] = {
 };
 
 const CodecMime ff_id3v2_mime_tags[] = {
-    { "image/gif",  AV_CODEC_ID_GIF   },
-    { "image/jpeg", AV_CODEC_ID_MJPEG },
-    { "image/jpg",  AV_CODEC_ID_MJPEG },
-    { "image/png",  AV_CODEC_ID_PNG   },
-    { "image/tiff", AV_CODEC_ID_TIFF  },
-    { "image/bmp",  AV_CODEC_ID_BMP   },
-    { "JPG",        AV_CODEC_ID_MJPEG }, /* ID3v2.2  */
-    { "PNG",        AV_CODEC_ID_PNG   }, /* ID3v2.2  */
-    { "",           AV_CODEC_ID_NONE  },
+    { "image/gif",  AV_CODEC_ID_GIF    },
+    { "image/jpeg", AV_CODEC_ID_MJPEG  },
+    { "image/jpg",  AV_CODEC_ID_MJPEG  },
+    { "image/jxl",  AV_CODEC_ID_JPEGXL },
+    { "image/png",  AV_CODEC_ID_PNG    },
+    { "image/tiff", AV_CODEC_ID_TIFF   },
+    { "image/bmp",  AV_CODEC_ID_BMP    },
+    { "image/webp", AV_CODEC_ID_WEBP   },
+    { "JPG",        AV_CODEC_ID_MJPEG  }, /* ID3v2.2  */
+    { "PNG",        AV_CODEC_ID_PNG    }, /* ID3v2.2  */
+    { "",           AV_CODEC_ID_NONE   },
 };
 
 int ff_id3v2_match(const uint8_t *buf, const char *magic)
@@ -171,6 +182,14 @@ static unsigned int get_size(AVIOContext *s, int len)
     return v;
 }
 
+static int is_syncsafe(unsigned int size)
+{
+    return !(size & ((0x80U <<  0) |
+                     (0x80U <<  8) |
+                     (0x80U << 16) |
+                     (0x80U << 24)));
+}
+
 static unsigned int size_to_syncsafe(unsigned int size)
 {
     return (((size) & (0x7f <<  0)) >> 0) +
@@ -197,20 +216,38 @@ static int is_tag(const char *buf, unsigned int len)
 }
 
 /**
- * Return 1 if the tag of length len at the given offset is valid, 0 if not, -1 on error
+ * Return 1 if the candidate frame boundary at offset (with rem bytes left in
+ * the ID3v2 tag after it) is followed by the end of the tag, zero padding, or
+ * a plausible 10-byte ID3v2.3/2.4 frame header; 0 if not, -1 on error.
  */
-static int check_tag(AVIOContext *s, int offset, unsigned int len)
+static int check_tag(AVIOContext *s, int64_t offset, unsigned int rem)
 {
     char tag[4];
+    unsigned int nsize, nlen;
 
-    if (len > 4 ||
-        avio_seek(s, offset, SEEK_SET) < 0 ||
-        avio_read(s, tag, len) < (int)len)
-        return -1;
-    else if (!AV_RB32(tag) || is_tag(tag, len))
+    if (!rem)
         return 1;
-
-    return 0;
+    if (avio_seek(s, offset, SEEK_SET) < 0)
+        return -1;
+    if (rem < sizeof(tag)) {
+        while (rem--)
+            if (avio_r8(s))
+                return 0;
+        return 1;
+    }
+    if (avio_read(s, tag, sizeof(tag)) < (int)sizeof(tag))
+        return -1;
+    if (!AV_RB32(tag))
+        return 1;
+    if (rem < ID3v2_HEADER_SIZE || !is_tag(tag, sizeof(tag)))
+        return 0;
+    nsize = avio_rb32(s);
+    nlen  = is_syncsafe(nsize) ? size_to_syncsafe(nsize) : nsize;
+    /* ID3v2 requires frames to be at least 1 byte, but id3v2_parse()
+     * explicitly skips empty frames (tlen == 0) to recover from broken tags.
+     * Accept nlen == 0 here as well so a valid synchsafe boundary followed by
+     * an empty frame is not rejected. */
+    return nlen <= rem - ID3v2_HEADER_SIZE;
 }
 
 /**
@@ -223,7 +260,6 @@ static void free_geobtag(void *obj)
     av_freep(&geob->file_name);
     av_freep(&geob->description);
     av_freep(&geob->data);
-    av_free(geob);
 }
 
 /**
@@ -244,7 +280,7 @@ static int decode_str(AVFormatContext *s, AVIOContext *pb, int encoding,
     int ret;
     uint8_t tmp;
     uint32_t ch = 1;
-    int left = *maxread;
+    int left = *maxread, dynsize;
     unsigned int (*get)(AVIOContext*) = avio_rb16;
     AVIOContext *dynbuf;
 
@@ -252,6 +288,9 @@ static int decode_str(AVFormatContext *s, AVIOContext *pb, int encoding,
         av_log(s, AV_LOG_ERROR, "Error opening memory stream\n");
         return ret;
     }
+
+    if (left == 0)
+        goto end;
 
     switch (encoding) {
     case ID3v2_ENCODING_ISO8859:
@@ -264,24 +303,28 @@ static int decode_str(AVFormatContext *s, AVIOContext *pb, int encoding,
 
     case ID3v2_ENCODING_UTF16BOM:
         if ((left -= 2) < 0) {
-            av_log(s, AV_LOG_ERROR, "Cannot read BOM value, input too short\n");
+            av_log(s, AV_LOG_ERROR, "Cannot read BOM value, input too short %d\n", left);
             ffio_free_dyn_buf(&dynbuf);
             *dst = NULL;
             return AVERROR_INVALIDDATA;
         }
-        switch (avio_rb16(pb)) {
+        uint16_t bom = avio_rb16(pb);
+        switch (bom) {
         case 0xfffe:
             get = avio_rl16;
+            break;
         case 0xfeff:
             break;
+        case 0: // empty string without bom
+            goto end;
         default:
-            av_log(s, AV_LOG_ERROR, "Incorrect BOM value\n");
+            av_log(s, AV_LOG_ERROR, "Incorrect BOM value: 0x%x\n", bom);
             ffio_free_dyn_buf(&dynbuf);
             *dst = NULL;
             *maxread = left;
             return AVERROR_INVALIDDATA;
         }
-        // fall-through
+        av_fallthrough;
 
     case ID3v2_ENCODING_UTF16BE:
         while ((left > 1) && ch) {
@@ -300,13 +343,18 @@ static int decode_str(AVFormatContext *s, AVIOContext *pb, int encoding,
         }
         break;
     default:
-        av_log(s, AV_LOG_WARNING, "Unknown encoding\n");
+        av_log(s, AV_LOG_WARNING, "Unknown encoding %d\n", encoding);
     }
 
+end:
     if (ch)
         avio_w8(dynbuf, 0);
 
-    avio_close_dyn_buf(dynbuf, dst);
+    dynsize = avio_close_dyn_buf(dynbuf, dst);
+    if (dynsize <= 0) {
+        av_freep(dst);
+        return AVERROR(ENOMEM);
+    }
     *maxread = left;
 
     return 0;
@@ -354,99 +402,118 @@ static void read_ttag(AVFormatContext *s, AVIOContext *pb, int taglen,
         av_dict_set(metadata, key, dst, dict_flags);
 }
 
-static void read_uslt(AVFormatContext *s, AVIOContext *pb, int taglen,
-                      AVDictionary **metadata)
-{
-    uint8_t lang[4];
-    uint8_t *descriptor = NULL; // 'Content descriptor'
-    uint8_t *text = NULL;
-    char *key = NULL;
-    int encoding;
-    int ok = 0;
-
-    if (taglen < 1)
-        goto error;
-
-    encoding = avio_r8(pb);
-    taglen--;
-
-    if (avio_read(pb, lang, 3) < 3)
-        goto error;
-    lang[3] = '\0';
-    taglen -= 3;
-
-    if (decode_str(s, pb, encoding, &descriptor, &taglen) < 0)
-        goto error;
-
-    if (decode_str(s, pb, encoding, &text, &taglen) < 0)
-        goto error;
-
-    // FFmpeg does not support hierarchical metadata, so concatenate the keys.
-    key = av_asprintf("lyrics-%s%s%s", descriptor[0] ? (char *)descriptor : "",
-                                       descriptor[0] ? "-" : "",
-                                       lang);
-    if (!key)
-        goto error;
-
-    av_dict_set(metadata, key, text, 0);
-
-    ok = 1;
-error:
-    if (!ok)
-        av_log(s, AV_LOG_ERROR, "Error reading lyrics, skipped\n");
-    av_free(descriptor);
-    av_free(text);
-    av_free(key);
-}
-
 /**
- * Parse a comment tag.
+ * Parse a lang descr tag such as COMM and USLT.
+ *
+ * A non-empty descriptor produces "<base>-<descriptor>-<lang>" keys.
  */
-static void read_comment(AVFormatContext *s, AVIOContext *pb, int taglen,
-                      AVDictionary **metadata)
+static void read_lang_descr_tag(AVFormatContext *s, AVIOContext *pb,
+                                const char *key, int taglen,
+                                AVDictionary **metadata)
 {
-    const char *key = "comment";
-    uint8_t *dst;
-    int encoding, dict_flags = AV_DICT_DONT_OVERWRITE | AV_DICT_DONT_STRDUP_VAL;
-    av_unused int language;
+    char *full_key = NULL;
+    uint8_t *dst, *descriptor = NULL;
+    int encoding;
+    char language[4] = {0};
+    int flags = AV_DICT_DONT_OVERWRITE | AV_DICT_DONT_STRDUP_VAL;
 
     if (taglen < 4)
         return;
 
     encoding = avio_r8(pb);
-    language = avio_rl24(pb);
+
+    if (avio_read(pb, language, 3) < 3) {
+        av_log(s, AV_LOG_ERROR, "Error reading %s frame language, skipped\n", key);
+        return;
+    }
+
+    for (char *p = language; *p; p++)
+        *p = av_tolower(*p);
+
+    // Some libraries set XXX for unknown language.
+    if (!strcmp(language, "xxx") ||
+        // By convention, "und" is represented as a key with
+        // no language, e.g. "comment" or "lyrics"
+        !strcmp(language, "und"))
+        memset(language, 0, sizeof(language));
+
     taglen -= 4;
 
-    if (decode_str(s, pb, encoding, &dst, &taglen) < 0) {
-        av_log(s, AV_LOG_ERROR, "Error reading comment frame, skipped\n");
+    if (decode_str(s, pb, encoding, &descriptor, &taglen) < 0) {
+        av_log(s, AV_LOG_ERROR, "Error reading %s frame descriptor, skipped\n", key);
         return;
     }
 
-    if (dst && !*dst)
-        av_freep(&dst);
-
-    if (dst) {
-        key = (const char *) dst;
-        dict_flags |= AV_DICT_DONT_STRDUP_KEY;
-    }
-
     if (decode_str(s, pb, encoding, &dst, &taglen) < 0) {
-        av_log(s, AV_LOG_ERROR, "Error reading comment frame, skipped\n");
-        if (dict_flags & AV_DICT_DONT_STRDUP_KEY)
-            av_freep((void*)&key);
+        av_freep(&descriptor);
+        av_log(s, AV_LOG_ERROR, "Error reading %s frame, skipped\n", key);
         return;
     }
 
-    if (dst)
-        av_dict_set(metadata, key, (const char *) dst, dict_flags);
+    if (descriptor && *descriptor) {
+#if FF_API_OLD_ID3V2_COMMENT
+        if (s && (s->flags & AVFMT_FLAG_LEGACY_ID3V2_COMM_KEYS) &&
+            !strcmp(key, "comment")) {
+            av_log(s, AV_LOG_WARNING,
+                   "Deprecated: COMM descriptor '%s' exported as metadata key. "
+                   "This will be removed in a future version.\n", descriptor);
+            av_dict_set(metadata, (const char *)descriptor, (const char *)dst,
+                        AV_DICT_DONT_OVERWRITE);
+        }
+#endif
+        int descr_len = strlen((char *)descriptor);
+        if (av_strnlen(language, 3) > 0)
+            full_key = av_asprintf("%s-%s-%s", key, descriptor, language);
+                 // descr = "eng"
+        else if ((descr_len == 3 &&
+                 ff_convert_lang_to((char *)descriptor, AV_LANG_ISO639_2_BIBL)) ||
+                 // descr = Foo-eng
+                 (descr_len > 4 && descriptor[descr_len-4] == '-' &&
+                 ff_convert_lang_to((char *)descriptor+descr_len-3, AV_LANG_ISO639_2_BIBL))) {
+            /* Descriptor looks like a lang code: add trailing lang to
+             * keep the key unambiguous on the write side. */
+            full_key = av_asprintf("%s-%s-und", key, descriptor);
+        } else
+            full_key = av_asprintf("%s-%s", key, descriptor);
+        if (!full_key) {
+            av_freep(&descriptor);
+            av_freep(&dst);
+            return;
+        }
+        key = full_key;
+    } else if (av_strnlen(language, 3) == 3) {
+        full_key = av_asprintf("%s-%s", key, language);
+        if (!full_key) {
+            av_freep(&descriptor);
+            av_freep(&dst);
+            return;
+        }
+        key = full_key;
+    }
+
+    av_freep(&descriptor);
+    av_dict_set(metadata, key, (const char *)dst, flags);
+    av_freep(&full_key);
+}
+
+typedef struct ExtraMetaList {
+    ID3v2ExtraMeta *head, *tail;
+} ExtraMetaList;
+
+static void list_append(ID3v2ExtraMeta *new_elem, ExtraMetaList *list)
+{
+    if (list->tail)
+        list->tail->next = new_elem;
+    else
+        list->head = new_elem;
+    list->tail = new_elem;
 }
 
 /**
  * Parse GEOB tag into a ID3v2ExtraMetaGEOB struct.
  */
 static void read_geobtag(AVFormatContext *s, AVIOContext *pb, int taglen,
-                         const char *tag, ID3v2ExtraMeta **extra_meta,
-                         int isv34)
+                         const char *tag, ExtraMetaList *extra_meta, int version)
 {
     ID3v2ExtraMetaGEOB *geob_data = NULL;
     ID3v2ExtraMeta *new_extra     = NULL;
@@ -456,19 +523,14 @@ static void read_geobtag(AVFormatContext *s, AVIOContext *pb, int taglen,
     if (taglen < 1)
         return;
 
-    geob_data = av_mallocz(sizeof(ID3v2ExtraMetaGEOB));
-    if (!geob_data) {
-        av_log(s, AV_LOG_ERROR, "Failed to alloc %"SIZE_SPECIFIER" bytes\n",
-               sizeof(ID3v2ExtraMetaGEOB));
+    new_extra = av_mallocz(sizeof(ID3v2ExtraMeta));
+    if (!new_extra) {
+        av_log(s, AV_LOG_ERROR, "Failed to alloc %zu bytes\n",
+               sizeof(ID3v2ExtraMeta));
         return;
     }
 
-    new_extra = av_mallocz(sizeof(ID3v2ExtraMeta));
-    if (!new_extra) {
-        av_log(s, AV_LOG_ERROR, "Failed to alloc %"SIZE_SPECIFIER" bytes\n",
-               sizeof(ID3v2ExtraMeta));
-        goto fail;
-    }
+    geob_data = &new_extra->data.geob;
 
     /* read encoding type byte */
     encoding = avio_r8(pb);
@@ -508,9 +570,7 @@ static void read_geobtag(AVFormatContext *s, AVIOContext *pb, int taglen,
 
     /* add data to the list */
     new_extra->tag  = "GEOB";
-    new_extra->data = geob_data;
-    new_extra->next = *extra_meta;
-    *extra_meta     = new_extra;
+    list_append(new_extra, extra_meta);
 
     return;
 
@@ -574,7 +634,6 @@ static void free_apic(void *obj)
     ID3v2ExtraMetaAPIC *apic = obj;
     av_buffer_unref(&apic->buf);
     av_freep(&apic->description);
-    av_freep(&apic);
 }
 
 static void rstrip_spaces(char *buf)
@@ -585,33 +644,38 @@ static void rstrip_spaces(char *buf)
 }
 
 static void read_apic(AVFormatContext *s, AVIOContext *pb, int taglen,
-                      const char *tag, ID3v2ExtraMeta **extra_meta,
-                      int isv34)
+                      const char *tag, ExtraMetaList *extra_meta, int version)
 {
     int enc, pic_type;
-    char mimetype[64];
+    char mimetype[64] = {0};
     const CodecMime *mime     = ff_id3v2_mime_tags;
     enum AVCodecID id         = AV_CODEC_ID_NONE;
     ID3v2ExtraMetaAPIC *apic  = NULL;
     ID3v2ExtraMeta *new_extra = NULL;
     int64_t end               = avio_tell(pb) + taglen;
 
-    if (taglen <= 4 || (!isv34 && taglen <= 6))
+    if (taglen <= 4 || (version == 2 && taglen <= 6))
         goto fail;
 
     new_extra = av_mallocz(sizeof(*new_extra));
-    apic      = av_mallocz(sizeof(*apic));
-    if (!new_extra || !apic)
+    if (!new_extra)
         goto fail;
+
+    apic = &new_extra->data.apic;
 
     enc = avio_r8(pb);
     taglen--;
 
     /* mimetype */
-    if (isv34) {
-        taglen -= avio_get_str(pb, taglen, mimetype, sizeof(mimetype));
+    if (version != 2) {
+        int ret = avio_get_str(pb, taglen, mimetype, sizeof(mimetype));
+        if (ret < 0 || ret >= taglen)
+            goto fail;
+        taglen -= ret;
     } else {
-        avio_read(pb, mimetype, 3);
+        if (avio_read(pb, mimetype, 3) < 0)
+            goto fail;
+
         mimetype[3] = 0;
         taglen    -= 3;
     }
@@ -653,13 +717,11 @@ static void read_apic(AVFormatContext *s, AVIOContext *pb, int taglen,
     memset(apic->buf->data + taglen, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
     new_extra->tag  = "APIC";
-    new_extra->data = apic;
-    new_extra->next = *extra_meta;
-    *extra_meta     = new_extra;
 
     // The description must be unique, and some ID3v2 tag writers add spaces
     // to write several APIC entries with the same description.
     rstrip_spaces(apic->description);
+    list_append(new_extra, extra_meta);
 
     return;
 
@@ -670,59 +732,79 @@ fail:
     avio_seek(pb, end, SEEK_SET);
 }
 
-static void read_chapter(AVFormatContext *s, AVIOContext *pb, int len, const char *ttag, ID3v2ExtraMeta **extra_meta, int isv34)
+static void free_chapter(void *obj)
 {
-    AVRational time_base = {1, 1000};
-    uint32_t start, end;
-    AVChapter *chapter;
-    uint8_t *dst = NULL;
-    int taglen;
+    ID3v2ExtraMetaCHAP *chap = obj;
+    av_freep(&chap->element_id);
+    av_dict_free(&chap->meta);
+}
+
+static void read_chapter(AVFormatContext *s, AVIOContext *pb, int len,
+                         const char *ttag, ExtraMetaList *extra_meta, int version)
+{
     char tag[5];
+    ID3v2ExtraMeta *new_extra = NULL;
+    ID3v2ExtraMetaCHAP *chap  = NULL;
 
-    if (!s) {
-        /* We should probably just put the chapter data to extra_meta here
-         * and do the AVFormatContext-needing part in a separate
-         * ff_id3v2_parse_apic()-like function. */
-        av_log(NULL, AV_LOG_DEBUG, "No AVFormatContext, skipped ID3 chapter data\n");
+    new_extra = av_mallocz(sizeof(*new_extra));
+    if (!new_extra)
         return;
-    }
 
-    if (decode_str(s, pb, 0, &dst, &len) < 0)
-        return;
+    chap = &new_extra->data.chap;
+
+    if (decode_str(s, pb, 0, &chap->element_id, &len) < 0)
+        goto fail;
+
     if (len < 16)
-        return;
+        goto fail;
 
-    start = avio_rb32(pb);
-    end   = avio_rb32(pb);
+    chap->start = avio_rb32(pb);
+    chap->end   = avio_rb32(pb);
     avio_skip(pb, 8);
-
-    chapter = avpriv_new_chapter(s, s->nb_chapters + 1, time_base, start, end, dst);
-    if (!chapter) {
-        av_free(dst);
-        return;
-    }
 
     len -= 16;
     while (len > 10) {
+        unsigned tlen;
+        int64_t start, consumed;
+
         if (avio_read(pb, tag, 4) < 4)
-            goto end;
+            break;
         tag[4] = 0;
-        taglen = avio_rb32(pb);
+        /* Embedded frames use the same header as the surrounding tag.
+         * 2.2 has no CHAP. 2.3 sizes are plain; 2.4 sizes are synchsafe. */
+        if (version == 4)
+            tlen = get_size(pb, 4);
+        else
+            tlen = avio_rb32(pb);
         avio_skip(pb, 2);
         len -= 10;
-        if (taglen < 0 || taglen > len)
-            goto end;
+        if (tlen > (unsigned)len) {
+            av_log(s, AV_LOG_WARNING,
+                   "Invalid ID3v2 chapter subframe %.4s size %u, keeping the chapter\n",
+                   tag, tlen);
+            break;
+        }
+        start = avio_tell(pb);
         if (tag[0] == 'T')
-            read_ttag(s, pb, taglen, &chapter->metadata, tag);
-        else
-            avio_skip(pb, taglen);
-        len -= taglen;
+            read_ttag(s, pb, tlen, &chap->meta, tag);
+        consumed = avio_tell(pb) - start;
+        if (consumed < 0 || consumed > tlen ||
+            avio_skip(pb, tlen - consumed) < 0)
+            break;
+        len -= tlen;
     }
 
-    ff_metadata_conv(&chapter->metadata, NULL, ff_id3v2_34_metadata_conv);
-    ff_metadata_conv(&chapter->metadata, NULL, ff_id3v2_4_metadata_conv);
-end:
-    av_free(dst);
+    ff_metadata_conv(&chap->meta, NULL, ff_id3v2_34_metadata_conv);
+    ff_metadata_conv(&chap->meta, NULL, ff_id3v2_4_metadata_conv);
+
+    new_extra->tag  = "CHAP";
+    list_append(new_extra, extra_meta);
+
+    return;
+
+fail:
+    free_chapter(chap);
+    av_freep(&new_extra);
 }
 
 static void free_priv(void *obj)
@@ -730,20 +812,19 @@ static void free_priv(void *obj)
     ID3v2ExtraMetaPRIV *priv = obj;
     av_freep(&priv->owner);
     av_freep(&priv->data);
-    av_freep(&priv);
 }
 
 static void read_priv(AVFormatContext *s, AVIOContext *pb, int taglen,
-                      const char *tag, ID3v2ExtraMeta **extra_meta, int isv34)
+                      const char *tag, ExtraMetaList *extra_meta, int version)
 {
     ID3v2ExtraMeta *meta;
     ID3v2ExtraMetaPRIV *priv;
 
     meta = av_mallocz(sizeof(*meta));
-    priv = av_mallocz(sizeof(*priv));
+    if (!meta)
+        return;
 
-    if (!meta || !priv)
-        goto fail;
+    priv = &meta->data.priv;
 
     if (decode_str(s, pb, ID3v2_ENCODING_ISO8859, &priv->owner, &taglen) < 0)
         goto fail;
@@ -758,15 +839,12 @@ static void read_priv(AVFormatContext *s, AVIOContext *pb, int taglen,
         goto fail;
 
     meta->tag   = "PRIV";
-    meta->data  = priv;
-    meta->next  = *extra_meta;
-    *extra_meta = meta;
+    list_append(meta, extra_meta);
 
     return;
 
 fail:
-    if (priv)
-        free_priv(priv);
+    free_priv(priv);
     av_freep(&meta);
 }
 
@@ -774,15 +852,15 @@ typedef struct ID3v2EMFunc {
     const char *tag3;
     const char *tag4;
     void (*read)(AVFormatContext *s, AVIOContext *pb, int taglen,
-                 const char *tag, ID3v2ExtraMeta **extra_meta,
-                 int isv34);
+                 const char *tag, ExtraMetaList *extra_meta,
+                 int version);
     void (*free)(void *obj);
 } ID3v2EMFunc;
 
 static const ID3v2EMFunc id3v2_extra_meta_funcs[] = {
     { "GEO", "GEOB", read_geobtag, free_geobtag },
     { "PIC", "APIC", read_apic,    free_apic    },
-    { "CHAP","CHAP", read_chapter, NULL         },
+    { "CHAP","CHAP", read_chapter, free_chapter },
     { "PRIV","PRIV", read_priv,    free_priv    },
     { NULL }
 };
@@ -808,15 +886,15 @@ static const ID3v2EMFunc *get_extra_meta_func(const char *tag, int isv34)
 
 static void id3v2_parse(AVIOContext *pb, AVDictionary **metadata,
                         AVFormatContext *s, int len, uint8_t version,
-                        uint8_t flags, ID3v2ExtraMeta **extra_meta)
+                        uint8_t flags, ExtraMetaList *extra_meta)
 {
     int isv34, unsync;
     unsigned tlen;
     char tag[5];
-    int64_t next, end = avio_tell(pb) + len;
+    int64_t next, end = avio_tell(pb);
     int taghdrlen;
     const char *reason = NULL;
-    AVIOContext pb_local;
+    FFIOContext pb_local;
     AVIOContext *pbx;
     unsigned char *buffer = NULL;
     int buffer_size       = 0;
@@ -824,6 +902,10 @@ static void id3v2_parse(AVIOContext *pb, AVDictionary **metadata,
     unsigned char *uncompressed_buffer = NULL;
     av_unused int uncompressed_buffer_size = 0;
     const char *comm_frame;
+
+    if (end > INT64_MAX - len - 10)
+        return;
+    end += len;
 
     av_log(s, AV_LOG_DEBUG, "id3v2 ver:%d flags:%02X len:%d\n", version, flags, len);
 
@@ -875,7 +957,7 @@ static void id3v2_parse(AVIOContext *pb, AVDictionary **metadata,
         int tunsync         = 0;
         int tcomp           = 0;
         int tencr           = 0;
-        unsigned long av_unused dlen;
+        av_unused unsigned long dlen;
 
         if (isv34) {
             if (avio_read(pb, tag, 4) < 4)
@@ -888,18 +970,23 @@ static void id3v2_parse(AVIOContext *pb, AVDictionary **metadata,
                  * so check the next tag to see which one to use */
                 tlen = avio_rb32(pb);
                 if (tlen > 0x7f) {
-                    if (tlen < len) {
-                        int64_t cur = avio_tell(pb);
+                    unsigned int rem = len - taghdrlen;
 
-                        if (ffio_ensure_seekback(pb, 2 /* tflags */ + tlen + 4 /* next tag */))
+                    if (tlen <= rem) {
+                        int64_t cur = avio_tell(pb);
+                        unsigned int ss_tlen = size_to_syncsafe(tlen);
+
+                        if (ffio_ensure_seekback(pb, 2 /* tflags */ +
+                                                 FFMIN(rem, tlen + ID3v2_HEADER_SIZE)))
                             break;
 
-                        if (check_tag(pb, cur + 2 + size_to_syncsafe(tlen), 4) == 1)
-                            tlen = size_to_syncsafe(tlen);
-                        else if (check_tag(pb, cur + 2 + tlen, 4) != 1)
+                        if (is_syncsafe(tlen) &&
+                            check_tag(pb, cur + 2 + ss_tlen, rem - ss_tlen) == 1)
+                            tlen = ss_tlen;
+                        else if (check_tag(pb, cur + 2 + tlen, rem - tlen) != 1)
                             break;
                         avio_seek(pb, cur, SEEK_SET);
-                    } else
+                    } else if (is_syncsafe(tlen))
                         tlen = size_to_syncsafe(tlen);
                 }
             }
@@ -966,66 +1053,91 @@ static void id3v2_parse(AVIOContext *pb, AVDictionary **metadata,
                 }
             }
             if (unsync || tunsync) {
-                int64_t end = avio_tell(pb) + tlen;
-                uint8_t *b;
+                uint8_t *b = buffer;
+                uint8_t *t = buffer;
 
-                b = buffer;
-                while (avio_tell(pb) < end && b - buffer < tlen && !pb->eof_reached) {
-                    *b++ = avio_r8(pb);
-                    if (*(b - 1) == 0xff && avio_tell(pb) < end - 1 &&
-                        b - buffer < tlen &&
-                        !pb->eof_reached ) {
-                        uint8_t val = avio_r8(pb);
-                        *b++ = val ? val : avio_r8(pb);
-                    }
+                if (avio_read(pb, buffer, tlen) != tlen) {
+                    av_log(s, AV_LOG_ERROR, "Failed to read tag data\n");
+                    goto seek;
                 }
-                ffio_init_context(&pb_local, buffer, b - buffer, 0, NULL, NULL, NULL,
-                                  NULL);
+
+                const uint8_t *const buf_end = t + tlen;
+                while (t != buf_end) {
+                    *b++ = *t++;
+                    if (t != buf_end && t[-1] == 0xff && !t[0])
+                        t++;
+                }
+
+                ffio_init_read_context(&pb_local, buffer, b - buffer);
                 tlen = b - buffer;
-                pbx  = &pb_local; // read from sync buffer
+                pbx  = &pb_local.pub; // read from sync buffer
             }
 
 #if CONFIG_ZLIB
-                if (tcomp) {
-                    int err;
+            if (tcomp) {
+                int err;
 
-                    av_log(s, AV_LOG_DEBUG, "Compresssed frame %s tlen=%d dlen=%ld\n", tag, tlen, dlen);
+                av_log(s, AV_LOG_DEBUG, "Compressed frame %s tlen=%d dlen=%ld\n", tag, tlen, dlen);
 
-                    av_fast_malloc(&uncompressed_buffer, &uncompressed_buffer_size, dlen);
-                    if (!uncompressed_buffer) {
-                        av_log(s, AV_LOG_ERROR, "Failed to alloc %ld bytes\n", dlen);
-                        goto seek;
-                    }
+                if (tlen <= 0)
+                    goto seek;
+                if (dlen / 32768 > tlen)
+                    goto seek;
 
-                    if (!(unsync || tunsync)) {
-                        err = avio_read(pb, buffer, tlen);
-                        if (err < 0) {
-                            av_log(s, AV_LOG_ERROR, "Failed to read compressed tag\n");
-                            goto seek;
-                        }
-                        tlen = err;
-                    }
-
-                    err = uncompress(uncompressed_buffer, &dlen, buffer, tlen);
-                    if (err != Z_OK) {
-                        av_log(s, AV_LOG_ERROR, "Failed to uncompress tag: %d\n", err);
-                        goto seek;
-                    }
-                    ffio_init_context(&pb_local, uncompressed_buffer, dlen, 0, NULL, NULL, NULL, NULL);
-                    tlen = dlen;
-                    pbx = &pb_local; // read from sync buffer
+                av_fast_malloc(&uncompressed_buffer, &uncompressed_buffer_size, dlen);
+                if (!uncompressed_buffer) {
+                    av_log(s, AV_LOG_ERROR, "Failed to alloc %ld bytes\n", dlen);
+                    goto seek;
                 }
+
+                if (!(unsync || tunsync)) {
+                    err = avio_read(pb, buffer, tlen);
+                    if (err < 0) {
+                        av_log(s, AV_LOG_ERROR, "Failed to read compressed tag\n");
+                        goto seek;
+                    }
+                    tlen = err;
+                }
+
+                err = uncompress(uncompressed_buffer, &dlen, buffer, tlen);
+                if (err != Z_OK) {
+                    av_log(s, AV_LOG_ERROR, "Failed to uncompress tag: %d\n", err);
+                    goto seek;
+                }
+                ffio_init_read_context(&pb_local, uncompressed_buffer, dlen);
+                tlen = dlen;
+                pbx = &pb_local.pub; // read from sync buffer
+            }
 #endif
+            if (s && (s->debug & AV_FDEBUG_ID3V2)) {
+                int64_t pos = avio_tell(pbx);
+                uint8_t *buf = av_malloc(tlen + 3U);
+                if (buf) {
+                    int n = avio_read(pbx, buf + 1, tlen);
+                    if (n >= 0) {
+                        buf[0] = '|';
+                        for (unsigned i = 1; i <= n; i++)
+                            if (!(buf[i] >= 0x20 && buf[i] < 0x7f))
+                                buf[i] = '.';
+                        buf[n + 1] = '|';
+                        buf[n + 2] = '\0';
+                        av_log(s, AV_LOG_INFO, "ID3v2 frame %.4s (%d bytes):%s\n",
+                               tag, tlen, buf);
+                    }
+                    av_free(buf);
+                    avio_seek(pbx, pos, SEEK_SET);
+                }
+            }
             if (tag[0] == 'T')
                 /* parse text tag */
                 read_ttag(s, pbx, tlen, metadata, tag);
             else if (!memcmp(tag, "USLT", 4))
-                read_uslt(s, pbx, tlen, metadata);
+                read_lang_descr_tag(s, pbx, "lyrics", tlen, metadata);
             else if (!strcmp(tag, comm_frame))
-                read_comment(s, pbx, tlen, metadata);
+                read_lang_descr_tag(s, pbx, "comment", tlen, metadata);
             else
                 /* parse special meta tag */
-                extra_func->read(s, pbx, tlen, tag, extra_meta, isv34);
+                extra_func->read(s, pbx, tlen, tag, extra_meta, version);
         } else if (!tag[0]) {
             if (tag[1])
                 av_log(s, AV_LOG_WARNING, "invalid frame id, assuming padding\n");
@@ -1053,12 +1165,16 @@ error:
 
 static void id3v2_read_internal(AVIOContext *pb, AVDictionary **metadata,
                                 AVFormatContext *s, const char *magic,
-                                ID3v2ExtraMeta **extra_meta, int64_t max_search_size)
+                                ID3v2ExtraMeta **extra_metap, int64_t max_search_size)
 {
     int len, ret;
     uint8_t buf[ID3v2_HEADER_SIZE];
+    ExtraMetaList extra_meta = { NULL };
     int found_header;
     int64_t start, off;
+
+    if (extra_metap)
+        *extra_metap = NULL;
 
     if (max_search_size && max_search_size < ID3v2_HEADER_SIZE)
         return;
@@ -1086,7 +1202,8 @@ static void id3v2_read_internal(AVIOContext *pb, AVDictionary **metadata,
                   ((buf[7] & 0x7f) << 14) |
                   ((buf[8] & 0x7f) << 7) |
                    (buf[9] & 0x7f);
-            id3v2_parse(pb, metadata, s, len, buf[3], buf[5], extra_meta);
+            id3v2_parse(pb, metadata, s, len, buf[3], buf[5],
+                        extra_metap ? &extra_meta : NULL);
         } else {
             avio_seek(pb, off, SEEK_SET);
         }
@@ -1095,12 +1212,14 @@ static void id3v2_read_internal(AVIOContext *pb, AVDictionary **metadata,
     ff_metadata_conv(metadata, NULL, id3v2_2_metadata_conv);
     ff_metadata_conv(metadata, NULL, ff_id3v2_4_metadata_conv);
     merge_date(metadata);
+    if (extra_metap)
+        *extra_metap = extra_meta.head;
 }
 
-void ff_id3v2_read_dict(AVIOContext *pb, AVDictionary **metadata,
+void ff_id3v2_read_dict(AVFormatContext *s, AVIOContext *pb, AVDictionary **metadata,
                         const char *magic, ID3v2ExtraMeta **extra_meta)
 {
-    id3v2_read_internal(pb, metadata, NULL, magic, extra_meta, 0);
+    id3v2_read_internal(pb, metadata, s, magic, extra_meta, 0);
 }
 
 void ff_id3v2_read(AVFormatContext *s, const char *magic,
@@ -1116,7 +1235,7 @@ void ff_id3v2_free_extra_meta(ID3v2ExtraMeta **extra_meta)
 
     while (current) {
         if ((extra_func = get_extra_meta_func(current->tag, 1)))
-            extra_func->free(current->data);
+            extra_func->free(&current->data);
         next = current->next;
         av_freep(&current);
         current = next;
@@ -1125,42 +1244,103 @@ void ff_id3v2_free_extra_meta(ID3v2ExtraMeta **extra_meta)
     *extra_meta = NULL;
 }
 
-int ff_id3v2_parse_apic(AVFormatContext *s, ID3v2ExtraMeta **extra_meta)
+int ff_id3v2_parse_apic(AVFormatContext *s, ID3v2ExtraMeta *extra_meta)
 {
     ID3v2ExtraMeta *cur;
 
-    for (cur = *extra_meta; cur; cur = cur->next) {
+    for (cur = extra_meta; cur; cur = cur->next) {
         ID3v2ExtraMetaAPIC *apic;
         AVStream *st;
+        int ret;
 
         if (strcmp(cur->tag, "APIC"))
             continue;
-        apic = cur->data;
+        apic = &cur->data.apic;
 
-        if (!(st = avformat_new_stream(s, NULL)))
-            return AVERROR(ENOMEM);
-
-        st->disposition      |= AV_DISPOSITION_ATTACHED_PIC;
-        st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+        ret = ff_add_attached_pic(s, NULL, NULL, &apic->buf, 0);
+        if (ret < 0)
+            return ret;
+        st  = s->streams[s->nb_streams - 1];
         st->codecpar->codec_id   = apic->id;
 
-        if (AV_RB64(apic->buf->data) == 0x89504e470d0a1a0a)
+        if (AV_RB64(st->attached_pic.data) == PNGSIG)
             st->codecpar->codec_id = AV_CODEC_ID_PNG;
 
         if (apic->description[0])
             av_dict_set(&st->metadata, "title", apic->description, 0);
 
         av_dict_set(&st->metadata, "comment", apic->type, 0);
-
-        av_init_packet(&st->attached_pic);
-        st->attached_pic.buf          = apic->buf;
-        st->attached_pic.data         = apic->buf->data;
-        st->attached_pic.size         = apic->buf->size - AV_INPUT_BUFFER_PADDING_SIZE;
-        st->attached_pic.stream_index = st->index;
-        st->attached_pic.flags       |= AV_PKT_FLAG_KEY;
-
-        apic->buf = NULL;
     }
 
     return 0;
+}
+
+int ff_id3v2_parse_chapters(AVFormatContext *s, ID3v2ExtraMeta *cur)
+{
+    AVRational time_base = {1, 1000};
+    int ret;
+
+    for (unsigned i = 0; cur; cur = cur->next) {
+        ID3v2ExtraMetaCHAP *chap;
+        AVChapter *chapter;
+
+        if (strcmp(cur->tag, "CHAP"))
+            continue;
+
+        chap = &cur->data.chap;
+        chapter = avpriv_new_chapter(s, i++, time_base, chap->start,
+                                     chap->end, chap->element_id);
+        if (!chapter)
+            continue;
+
+        if ((ret = av_dict_copy(&chapter->metadata, chap->meta, 0)) < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+int ff_id3v2_parse_priv_dict(AVDictionary **metadata, ID3v2ExtraMeta *extra_meta)
+{
+    ID3v2ExtraMeta *cur;
+    int dict_flags = AV_DICT_DONT_OVERWRITE | AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL;
+
+    for (cur = extra_meta; cur; cur = cur->next) {
+        if (!strcmp(cur->tag, "PRIV")) {
+            ID3v2ExtraMetaPRIV *priv = &cur->data.priv;
+            AVBPrint bprint;
+            char *escaped, *key;
+            int i, ret;
+
+            if ((key = av_asprintf(ID3v2_PRIV_METADATA_PREFIX "%s", priv->owner)) == NULL) {
+                return AVERROR(ENOMEM);
+            }
+
+            av_bprint_init(&bprint, priv->datasize + 1, AV_BPRINT_SIZE_UNLIMITED);
+
+            for (i = 0; i < priv->datasize; i++) {
+                if (priv->data[i] < 32 || priv->data[i] > 126 || priv->data[i] == '\\') {
+                    av_bprintf(&bprint, "\\x%02x", priv->data[i]);
+                } else {
+                    av_bprint_chars(&bprint, priv->data[i], 1);
+                }
+            }
+
+            if ((ret = av_bprint_finalize(&bprint, &escaped)) < 0) {
+                av_free(key);
+                return ret;
+            }
+
+            if ((ret = av_dict_set(metadata, key, escaped, dict_flags)) < 0) {
+                return ret;
+            }
+        }
+    }
+
+    return 0;
+}
+
+int ff_id3v2_parse_priv(AVFormatContext *s, ID3v2ExtraMeta *extra_meta)
+{
+    return ff_id3v2_parse_priv_dict(&s->metadata, extra_meta);
 }

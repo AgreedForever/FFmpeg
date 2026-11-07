@@ -1,5 +1,5 @@
 /*
- * Chinese AVS video (AVS1-P2, JiZhun profile) decoder.
+ * Chinese AVS video (AVS1-P2/P16, JiZhun and Broadcasting profiles) decoder.
  * Copyright (c) 2006  Stefan Gehrer <stefan.gehrer@gmx.de>
  *
  * This file is part of FFmpeg.
@@ -22,9 +22,9 @@
 #ifndef AVCODEC_CAVSDSP_H
 #define AVCODEC_CAVSDSP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
-#include "avcodec.h"
 #include "qpeldsp.h"
 
 typedef struct CAVSDSPContext {
@@ -38,7 +38,7 @@ typedef struct CAVSDSPContext {
     int idct_perm;
 } CAVSDSPContext;
 
-void ff_cavsdsp_init(CAVSDSPContext* c, AVCodecContext *avctx);
-void ff_cavsdsp_init_x86(CAVSDSPContext* c, AVCodecContext *avctx);
+void ff_cavsdsp_init(CAVSDSPContext* c);
+void ff_cavsdsp_init_x86(CAVSDSPContext* c);
 
 #endif /* AVCODEC_CAVSDSP_H */

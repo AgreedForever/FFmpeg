@@ -26,23 +26,21 @@
 
 static int usage(const char *argv0, int ret)
 {
-    fprintf(stderr, "%s [-b bytespersec] [-d duration] [-oi <options>] [-oo <options>] input_url output_url\n", argv0);
+    fprintf(stderr, "%s [-b bytespersec] [-d duration] [-oi <options>] [-oo <options>] [-v] input_url output_url\n", argv0);
     fprintf(stderr, "<options>: AVOptions expressed as key=value, :-separated\n");
     return ret;
 }
 
 int main(int argc, char **argv)
 {
-    int bps = 0, duration = 0, ret, i;
+    int bps = 0, duration = 0, verbose = 0, ret, i;
     const char *input_url = NULL, *output_url = NULL;
     int64_t stream_pos = 0;
     int64_t start_time;
-    char errbuf[50];
     AVIOContext *input, *output;
     AVDictionary *in_opts = NULL;
     AVDictionary *out_opts = NULL;
 
-    av_register_all();
     avformat_network_init();
 
     for (i = 1; i < argc; i++) {
@@ -66,6 +64,8 @@ int main(int argc, char **argv)
                 return usage(argv[0], 1);
             }
             i++;
+        } else if (!strcmp(argv[i], "-v")) {
+            verbose = 1;
         } else if (!input_url) {
             input_url = argv[i];
         } else if (!output_url) {
@@ -79,23 +79,28 @@ int main(int argc, char **argv)
 
     ret = avio_open2(&input, input_url, AVIO_FLAG_READ, NULL, &in_opts);
     if (ret) {
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Unable to open %s: %s\n", input_url, errbuf);
+        fprintf(stderr, "Unable to open %s: %s\n", input_url, av_err2str(ret));
         return 1;
+    }
+    if (verbose) {
+        int64_t size = avio_seek(input, 0, AVSEEK_SIZE);
+        if (size >= 0) {
+            fprintf(stderr, "aviocat: input size: %"PRId64"\n", size);
+        } else {
+            fprintf(stderr, "aviocat: input size: unknown\n");
+        }
     }
     if (duration && !bps) {
         int64_t size = avio_size(input);
         if (size < 0) {
-            av_strerror(ret, errbuf, sizeof(errbuf));
-            fprintf(stderr, "Unable to get size of %s: %s\n", input_url, errbuf);
+            fprintf(stderr, "Unable to get size of %s: %s\n", input_url, av_err2str(ret));
             goto fail;
         }
         bps = size / duration;
     }
     ret = avio_open2(&output, output_url, AVIO_FLAG_WRITE, NULL, &out_opts);
     if (ret) {
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Unable to open %s: %s\n", output_url, errbuf);
+        fprintf(stderr, "Unable to open %s: %s\n", output_url, av_err2str(ret));
         goto fail;
     }
 
@@ -107,6 +112,10 @@ int main(int argc, char **argv)
         if (n <= 0)
             break;
         avio_write(output, buf, n);
+        if (output->error) {
+            fprintf(stderr, "Unable to write %s: %s\n", output_url, av_err2str(output->error));
+            break;
+        }
         stream_pos += n;
         if (bps) {
             avio_flush(output);

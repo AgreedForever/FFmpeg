@@ -50,13 +50,13 @@ includedir=${source_path}
 prefix=
 exec_prefix=
 libdir=\${pcfiledir}/../../../$name
-includedir=${source_path}
+includedir=${includedir}
 
 Name: $fullname
 Description: $comment
 Version: $version
 Requires: $requires
 Conflicts:
-Libs: -L\${libdir} -Wl,-rpath,\${libdir} -l${fullname#lib} $($shared || echo $libs)
+Libs: -L\${libdir} $($shared && echo -Wl,-rpath,\${libdir}) -l${fullname#lib} $($shared || echo $libs)
 Cflags: -I\${includedir}
 EOF

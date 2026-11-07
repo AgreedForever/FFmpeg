@@ -1,7 +1,5 @@
 /*
  * Direct Stream Digital (DSD) decoder
- * based on BSD licensed dsd2pcm by Sebastian Gesemann
- * Copyright (c) 2009, 2011 Sebastian Gesemann. All rights reserved.
  * Copyright (c) 2014 Peter Ross
  *
  * This file is part of FFmpeg.
@@ -21,66 +19,42 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavcodec/internal.h"
-#include "libavcodec/mathops.h"
-#include "avcodec.h"
-#include "dsd_tablegen.h"
+#include "config.h"
+
+#include "version_major.h"
+#include "libavutil/attributes.h"
 #include "dsd.h"
 
-static av_cold void dsd_ctables_tableinit(void)
+#if CONFIG_SWRESAMPLE && FF_API_DSD_PCM
+#include "libswresample/swresample.h"
+#include "avcodec.h"
+
+av_cold int ff_dsd_to_pcm_init(AVCodecContext *avctx, struct SwrContext **swrp)
 {
-    int t, e, m, sign;
-    double acc[CTABLES];
-    for (e = 0; e < 256; ++e) {
-        memset(acc, 0, sizeof(acc));
-        for (m = 0; m < 8; ++m) {
-            sign = (((e >> (7 - m)) & 1) * 2 - 1);
-            for (t = 0; t < CTABLES; ++t)
-                acc[t] += sign * htaps[t * 8 + m];
-        }
-        for (t = 0; t < CTABLES; ++t)
-            ctables[CTABLES - 1 - t][e] = acc[t];
-    }
-}
+    SwrContext *swr = NULL;
+    int ret;
 
-av_cold void ff_init_dsd_data(void)
-{
-    static int done = 0;
-    if (done)
-        return;
-    dsd_ctables_tableinit();
-    done = 1;
-}
+    swr_free(swrp);
 
-void ff_dsd2pcm_translate(DSDContext* s, size_t samples, int lsbf,
-                          const unsigned char *src, ptrdiff_t src_stride,
-                          float *dst, ptrdiff_t dst_stride)
-{
-    unsigned pos, i;
-    unsigned char* p;
-    double sum;
+    ret = swr_alloc_set_opts2(&swr, &avctx->ch_layout, avctx->sample_fmt,
+                              avctx->sample_rate, &avctx->ch_layout,
+                              AV_SAMPLE_FMT_DSD, avctx->sample_rate, 0, avctx);
+    if (ret < 0)
+        return ret;
 
-    pos = s->pos;
-
-    while (samples-- > 0) {
-        s->buf[pos] = lsbf ? ff_reverse[*src] : *src;
-        src += src_stride;
-
-        p = s->buf + ((pos - CTABLES) & FIFOMASK);
-        *p = ff_reverse[*p];
-
-        sum = 0.0;
-        for (i = 0; i < CTABLES; i++) {
-            unsigned char a = s->buf[(pos                   - i) & FIFOMASK];
-            unsigned char b = s->buf[(pos - (CTABLES*2 - 1) + i) & FIFOMASK];
-            sum += ctables[i][a] + ctables[i][b];
-        }
-
-        *dst = (float)sum;
-        dst += dst_stride;
-
-        pos = (pos + 1) & FIFOMASK;
+    ret = swr_init(swr);
+    if (ret < 0) {
+        swr_free(&swr);
+        return ret;
     }
 
-    s->pos = pos;
+    av_log(avctx, AV_LOG_WARNING,
+           "Converting DSD to PCM in the decoder is deprecated and will be "
+           "removed. Set request_sample_fmt to AV_SAMPLE_FMT_DSD to receive "
+           "the raw bitstream, and use libswresample to convert it to PCM "
+           "when needed.\n");
+
+    *swrp = swr;
+    return 0;
 }
+#endif

@@ -32,34 +32,37 @@
 #if HAVE_IO_H
 #include <io.h>
 #endif
+#include <inttypes.h>
 #include <stdarg.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include "avutil.h"
+#include <string.h>
 #include "bprint.h"
 #include "common.h"
 #include "internal.h"
 #include "log.h"
+#include "thread.h"
+#include "time.h"
+#include "time_internal.h"
 
-#if HAVE_PTHREADS
-#include <pthread.h>
-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-#endif
+static AVMutex mutex = AV_MUTEX_INITIALIZER;
 
 #define LINE_SZ 1024
 
-#if HAVE_VALGRIND_VALGRIND_H
+#if HAVE_VALGRIND_VALGRIND_H && CONFIG_VALGRIND_BACKTRACE
 #include <valgrind/valgrind.h>
 /* this is the log level at which valgrind will output a full backtrace */
 #define BACKTRACE_LOGLEVEL AV_LOG_ERROR
 #endif
 
-static int av_log_level = AV_LOG_INFO;
-static int flags;
+static atomic_int av_log_level = AV_LOG_INFO;
+static atomic_int av_log_flags = 0;
 
 #define NB_LEVELS 8
-#if defined(_WIN32) && !defined(__MINGW32CE__) && HAVE_SETCONSOLETEXTATTRIBUTE
+#if defined(_WIN32) && HAVE_SETCONSOLETEXTATTRIBUTE && HAVE_GETSTDHANDLE
 #include <windows.h>
-static const uint8_t color[16 + AV_CLASS_CATEGORY_NB] = {
+static const uint8_t win_color[16 + AV_CLASS_CATEGORY_NB] = {
     [AV_LOG_PANIC  /8] = 12,
     [AV_LOG_FATAL  /8] = 12,
     [AV_LOG_ERROR  /8] = 12,
@@ -79,6 +82,7 @@ static const uint8_t color[16 + AV_CLASS_CATEGORY_NB] = {
     [16+AV_CLASS_CATEGORY_BITSTREAM_FILTER] =  9,
     [16+AV_CLASS_CATEGORY_SWSCALER        ] =  7,
     [16+AV_CLASS_CATEGORY_SWRESAMPLER     ] =  7,
+    [16+AV_CLASS_CATEGORY_HWDEVICE        ] =  6,
     [16+AV_CLASS_CATEGORY_DEVICE_VIDEO_OUTPUT ] = 13,
     [16+AV_CLASS_CATEGORY_DEVICE_VIDEO_INPUT  ] = 5,
     [16+AV_CLASS_CATEGORY_DEVICE_AUDIO_OUTPUT ] = 13,
@@ -89,7 +93,7 @@ static const uint8_t color[16 + AV_CLASS_CATEGORY_NB] = {
 
 static int16_t background, attr_orig;
 static HANDLE con;
-#else
+#endif
 
 static const uint32_t color[16 + AV_CLASS_CATEGORY_NB] = {
     [AV_LOG_PANIC  /8] =  52 << 16 | 196 << 8 | 0x41,
@@ -111,6 +115,7 @@ static const uint32_t color[16 + AV_CLASS_CATEGORY_NB] = {
     [16+AV_CLASS_CATEGORY_BITSTREAM_FILTER] = 192 << 8 | 0x14,
     [16+AV_CLASS_CATEGORY_SWSCALER        ] = 153 << 8 | 0x14,
     [16+AV_CLASS_CATEGORY_SWRESAMPLER     ] = 147 << 8 | 0x14,
+    [16+AV_CLASS_CATEGORY_HWDEVICE        ] = 214 << 8 | 0x13,
     [16+AV_CLASS_CATEGORY_DEVICE_VIDEO_OUTPUT ] = 213 << 8 | 0x15,
     [16+AV_CLASS_CATEGORY_DEVICE_VIDEO_INPUT  ] = 207 << 8 | 0x05,
     [16+AV_CLASS_CATEGORY_DEVICE_AUDIO_OUTPUT ] = 213 << 8 | 0x15,
@@ -119,59 +124,82 @@ static const uint32_t color[16 + AV_CLASS_CATEGORY_NB] = {
     [16+AV_CLASS_CATEGORY_DEVICE_INPUT        ] = 207 << 8 | 0x05,
 };
 
-#endif
 static int use_color = -1;
+
+#if defined(_WIN32) && HAVE_SETCONSOLETEXTATTRIBUTE && HAVE_GETSTDHANDLE
+static void win_console_puts(const char *str)
+{
+    const uint8_t *q = str;
+    uint16_t line[LINE_SZ];
+
+    while (*q) {
+        uint16_t *buf = line;
+        DWORD nb_chars = 0;
+        DWORD written;
+
+        while (*q && nb_chars < LINE_SZ - 1) {
+            uint32_t ch;
+            uint16_t tmp;
+
+            GET_UTF8(ch, *q ? *q++ : 0, ch = 0xfffd; goto continue_on_invalid;)
+continue_on_invalid:
+            PUT_UTF16(ch, tmp, *buf++ = tmp; nb_chars++;)
+        }
+
+        WriteConsoleW(con, line, nb_chars, &written, NULL);
+    }
+}
+#endif
 
 static void check_color_terminal(void)
 {
-#if defined(_WIN32) && !defined(__MINGW32CE__) && HAVE_SETCONSOLETEXTATTRIBUTE
+    char *term = getenv("TERM");
+
+#if defined(_WIN32) && HAVE_SETCONSOLETEXTATTRIBUTE && HAVE_GETSTDHANDLE
     CONSOLE_SCREEN_BUFFER_INFO con_info;
+    DWORD dummy;
     con = GetStdHandle(STD_ERROR_HANDLE);
-    use_color = (con != INVALID_HANDLE_VALUE) && !getenv("NO_COLOR") &&
-                !getenv("AV_LOG_FORCE_NOCOLOR");
-    if (use_color) {
+    if (con != INVALID_HANDLE_VALUE && !GetConsoleMode(con, &dummy))
+        con = INVALID_HANDLE_VALUE;
+    if (con != INVALID_HANDLE_VALUE) {
         GetConsoleScreenBufferInfo(con, &con_info);
         attr_orig  = con_info.wAttributes;
         background = attr_orig & 0xF0;
     }
-#elif HAVE_ISATTY
-    char *term = getenv("TERM");
-    use_color = !getenv("NO_COLOR") && !getenv("AV_LOG_FORCE_NOCOLOR") &&
-                (getenv("TERM") && isatty(2) || getenv("AV_LOG_FORCE_COLOR"));
-    if (   getenv("AV_LOG_FORCE_256COLOR")
-        || (term && strstr(term, "256color")))
-        use_color *= 256;
-#else
-    use_color = getenv("AV_LOG_FORCE_COLOR") && !getenv("NO_COLOR") &&
-               !getenv("AV_LOG_FORCE_NOCOLOR");
 #endif
+
+    if (getenv("AV_LOG_FORCE_NOCOLOR")) {
+        use_color = 0;
+    } else if (getenv("AV_LOG_FORCE_COLOR")) {
+        use_color = 1;
+    } else {
+#if defined(_WIN32) && HAVE_SETCONSOLETEXTATTRIBUTE && HAVE_GETSTDHANDLE
+        use_color = (con != INVALID_HANDLE_VALUE);
+#elif HAVE_ISATTY
+        use_color = (term && isatty(2));
+#else
+        use_color = 0;
+#endif
+    }
+
+    if (getenv("AV_LOG_FORCE_256COLOR") || term && strstr(term, "256color"))
+        use_color *= 256;
 }
 
-static void colored_fputs(int level, int tint, const char *str)
+static void ansi_fputs(int level, int tint, const char *str, int local_use_color)
 {
-    int local_use_color;
-    if (!*str)
-        return;
-
-    if (use_color < 0)
-        check_color_terminal();
-
-    if (level == AV_LOG_INFO/8) local_use_color = 0;
-    else                        local_use_color = use_color;
-
-#if defined(_WIN32) && !defined(__MINGW32CE__) && HAVE_SETCONSOLETEXTATTRIBUTE
-    if (local_use_color)
-        SetConsoleTextAttribute(con, background | color[level]);
-    fputs(str, stderr);
-    if (local_use_color)
-        SetConsoleTextAttribute(con, attr_orig);
-#else
     if (local_use_color == 1) {
+        uint32_t intensity = (color[level] >> 4) & 15;
+        uint32_t fg       = color[level] & 15;
+#if defined(_WIN32)
+        /* Piped stderr is 8-color ANSI. Linux keeps 0;33m; Windows console
+         * already uses win_color 14 (bright yellow), so match that here. */
+        if (level == AV_LOG_WARNING / 8)
+            intensity = 1;
+#endif
         fprintf(stderr,
                 "\033[%"PRIu32";3%"PRIu32"m%s\033[0m",
-                (color[level] >> 4) & 15,
-                color[level] & 15,
-                str);
+                intensity, fg, str);
     } else if (tint && use_color == 256) {
         fprintf(stderr,
                 "\033[48;5;%"PRIu32"m\033[38;5;%dm%s\033[0m",
@@ -186,6 +214,32 @@ static void colored_fputs(int level, int tint, const char *str)
                 str);
     } else
         fputs(str, stderr);
+}
+
+static void colored_fputs(int level, int tint, const char *str)
+{
+    int local_use_color;
+    if (!*str)
+        return;
+
+    if (use_color < 0)
+        check_color_terminal();
+
+    if (level == AV_LOG_INFO/8) local_use_color = 0;
+    else                        local_use_color = use_color;
+
+#if defined(_WIN32) && HAVE_SETCONSOLETEXTATTRIBUTE && HAVE_GETSTDHANDLE
+    if (con != INVALID_HANDLE_VALUE) {
+        if (local_use_color)
+            SetConsoleTextAttribute(con, background | win_color[level]);
+        win_console_puts(str);
+        if (local_use_color)
+            SetConsoleTextAttribute(con, attr_orig);
+    } else {
+        ansi_fputs(level, tint, str, local_use_color);
+    }
+#else
+    ansi_fputs(level, tint, str, local_use_color);
 #endif
 
 }
@@ -228,6 +282,8 @@ static const char *get_level_str(int level)
         return "quiet";
     case AV_LOG_DEBUG:
         return "debug";
+    case AV_LOG_TRACE:
+        return "trace";
     case AV_LOG_VERBOSE:
         return "verbose";
     case AV_LOG_INFO:
@@ -245,14 +301,38 @@ static const char *get_level_str(int level)
     }
 }
 
+static const char *item_name(void *obj, const AVClass *cls)
+{
+    return (cls->item_name ? cls->item_name : av_default_item_name)(obj);
+}
+
+static void format_date_now(AVBPrint* bp_time, int include_date)
+{
+    struct tm *ptm, tmbuf;
+    const int64_t time_us = av_gettime();
+    const int64_t time_ms = time_us / 1000;
+    const time_t time_s   = time_ms / 1000;
+    const int millisec    = time_ms - (time_s * 1000);
+    ptm                   = localtime_r(&time_s, &tmbuf);
+    if (ptm) {
+        if (include_date)
+            av_bprint_strftime(bp_time, "%Y-%m-%d ", ptm);
+
+        av_bprint_strftime(bp_time, "%H:%M:%S", ptm);
+        av_bprintf(bp_time, ".%03d ", millisec);
+    }
+}
+
 static void format_line(void *avcl, int level, const char *fmt, va_list vl,
-                        AVBPrint part[4], int *print_prefix, int type[2])
+                        AVBPrint part[5], int *print_prefix, int type[2])
 {
     AVClass* avc = avcl ? *(AVClass **) avcl : NULL;
-    av_bprint_init(part+0, 0, 1);
-    av_bprint_init(part+1, 0, 1);
-    av_bprint_init(part+2, 0, 1);
+    av_bprint_init(part+0, 0, AV_BPRINT_SIZE_AUTOMATIC);
+    av_bprint_init(part+1, 0, AV_BPRINT_SIZE_AUTOMATIC);
+    av_bprint_init(part+2, 0, AV_BPRINT_SIZE_AUTOMATIC);
     av_bprint_init(part+3, 0, 65536);
+    av_bprint_init(part+4, 0, AV_BPRINT_SIZE_AUTOMATIC);
+    int flags = atomic_load_explicit(&av_log_flags, memory_order_relaxed);
 
     if(type) type[0] = type[1] = AV_CLASS_CATEGORY_NA + 16;
     if (*print_prefix && avc) {
@@ -261,17 +341,20 @@ static void format_line(void *avcl, int level, const char *fmt, va_list vl,
                                    avc->parent_log_context_offset);
             if (parent && *parent) {
                 av_bprintf(part+0, "[%s @ %p] ",
-                         (*parent)->item_name(parent), parent);
+                           item_name(parent, *parent), parent);
                 if(type) type[0] = get_category(parent);
             }
         }
         av_bprintf(part+1, "[%s @ %p] ",
-                 avc->item_name(avcl), avcl);
+                   item_name(avcl, avc), avcl);
         if(type) type[1] = get_category(avcl);
-
-        if (flags & AV_LOG_PRINT_LEVEL)
-            av_bprintf(part+2, "[%s] ", get_level_str(level));
     }
+
+    if (*print_prefix && (level > AV_LOG_QUIET) && (flags & (AV_LOG_PRINT_TIME | AV_LOG_PRINT_DATETIME)))
+        format_date_now(&part[4], flags & AV_LOG_PRINT_DATETIME);
+
+    if (*print_prefix && (level > AV_LOG_QUIET) && (flags & AV_LOG_PRINT_LEVEL))
+        av_bprintf(part+2, "[%s] ", get_level_str(level));
 
     av_vbprintf(part+3, fmt, vl);
 
@@ -290,7 +373,7 @@ void av_log_format_line(void *ptr, int level, const char *fmt, va_list vl,
 int av_log_format_line2(void *ptr, int level, const char *fmt, va_list vl,
                         char *line, int line_size, int *print_prefix)
 {
-    AVBPrint part[4];
+    AVBPrint part[5];
     int ret;
 
     format_line(ptr, level, fmt, vl, part, print_prefix, NULL);
@@ -304,7 +387,7 @@ void av_log_default_callback(void* ptr, int level, const char* fmt, va_list vl)
     static int print_prefix = 1;
     static int count;
     static char prev[LINE_SZ];
-    AVBPrint part[4];
+    AVBPrint part[5];
     char line[LINE_SZ];
     static int is_atty;
     int type[2];
@@ -315,11 +398,9 @@ void av_log_default_callback(void* ptr, int level, const char* fmt, va_list vl)
         level &= 0xff;
     }
 
-    if (level > av_log_level)
+    if (level > atomic_load_explicit(&av_log_level, memory_order_relaxed))
         return;
-#if HAVE_PTHREADS
-    pthread_mutex_lock(&mutex);
-#endif
+    ff_mutex_lock(&mutex);
 
     format_line(ptr, level, fmt, vl, part, &print_prefix, type);
     snprintf(line, sizeof(line), "%s%s%s%s", part[0].str, part[1].str, part[2].str, part[3].str);
@@ -329,7 +410,7 @@ void av_log_default_callback(void* ptr, int level, const char* fmt, va_list vl)
         is_atty = isatty(2) ? 1 : -1;
 #endif
 
-    if (print_prefix && (flags & AV_LOG_SKIP_REPEATED) && !strcmp(line, prev) &&
+    if (print_prefix && (atomic_load_explicit(&av_log_flags, memory_order_relaxed) & AV_LOG_SKIP_REPEATED) && !strcmp(line, prev) &&
         *line && line[strlen(line) - 1] != '\r'){
         count++;
         if (is_atty == 1)
@@ -341,6 +422,9 @@ void av_log_default_callback(void* ptr, int level, const char* fmt, va_list vl)
         count = 0;
     }
     strcpy(prev, line);
+
+    sanitize(part[4].str);
+    colored_fputs(7, 0, part[4].str);
     sanitize(part[0].str);
     colored_fputs(type[0], 0, part[0].str);
     sanitize(part[1].str);
@@ -356,56 +440,63 @@ void av_log_default_callback(void* ptr, int level, const char* fmt, va_list vl)
 #endif
 end:
     av_bprint_finalize(part+3, NULL);
-#if HAVE_PTHREADS
-    pthread_mutex_unlock(&mutex);
-#endif
+    ff_mutex_unlock(&mutex);
 }
 
-static void (*av_log_callback)(void*, int, const char*, va_list) =
-    av_log_default_callback;
+static void (*_Atomic av_log_callback)(void*, int, const char*, va_list) = av_log_default_callback;
 
 void av_log(void* avcl, int level, const char *fmt, ...)
 {
-    AVClass* avc = avcl ? *(AVClass **) avcl : NULL;
     va_list vl;
     va_start(vl, fmt);
-    if (avc && avc->version >= (50 << 16 | 15 << 8 | 2) &&
-        avc->log_level_offset_offset && level >= AV_LOG_FATAL)
-        level += *(int *) (((uint8_t *) avcl) + avc->log_level_offset_offset);
     av_vlog(avcl, level, fmt, vl);
     va_end(vl);
 }
 
+void av_log_once(void* avcl, int initial_level, int subsequent_level, int *state, const char *fmt, ...)
+{
+    va_list vl;
+    va_start(vl, fmt);
+    av_vlog(avcl, *state ? subsequent_level : initial_level, fmt, vl);
+    va_end(vl);
+    *state = 1;
+}
+
 void av_vlog(void* avcl, int level, const char *fmt, va_list vl)
 {
-    void (*log_callback)(void*, int, const char*, va_list) = av_log_callback;
+    AVClass* avc = avcl ? *(AVClass **) avcl : NULL;
+    void (*log_callback)(void*, int, const char*, va_list) =
+        atomic_load_explicit(&av_log_callback, memory_order_relaxed);
+    if (avc && avc->version >= (50 << 16 | 15 << 8 | 2) &&
+        avc->log_level_offset_offset && level >= AV_LOG_FATAL)
+        level += *(int *) (((uint8_t *) avcl) + avc->log_level_offset_offset);
     if (log_callback)
         log_callback(avcl, level, fmt, vl);
 }
 
 int av_log_get_level(void)
 {
-    return av_log_level;
+    return atomic_load_explicit(&av_log_level, memory_order_relaxed);
 }
 
 void av_log_set_level(int level)
 {
-    av_log_level = level;
+    atomic_store_explicit(&av_log_level, level, memory_order_relaxed);
 }
 
 void av_log_set_flags(int arg)
 {
-    flags = arg;
+    atomic_store_explicit(&av_log_flags, arg, memory_order_relaxed);
 }
 
 int av_log_get_flags(void)
 {
-    return flags;
+    return atomic_load_explicit(&av_log_flags, memory_order_relaxed);
 }
 
 void av_log_set_callback(void (*callback)(void*, int, const char*, va_list))
 {
-    av_log_callback = callback;
+    atomic_store_explicit(&av_log_callback, callback, memory_order_relaxed);
 }
 
 static void missing_feature_sample(int sample, void *avc, const char *msg,
@@ -418,7 +509,7 @@ static void missing_feature_sample(int sample, void *avc, const char *msg,
            "been implemented.\n");
     if (sample)
         av_log(avc, AV_LOG_WARNING, "If you want to help, upload a sample "
-               "of this file to ftp://upload.ffmpeg.org/incoming/ "
+               "of this file to https://streams.videolan.org/upload/ "
                "and contact the ffmpeg-devel mailing list. (ffmpeg-devel@ffmpeg.org)\n");
 }
 

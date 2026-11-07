@@ -20,7 +20,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavcodec/internal.h"
+#include "libavcodec/startcode.h"
 #include "avformat.h"
 #include "rtpenc.h"
 
@@ -59,7 +59,7 @@ void ff_rtp_send_mpegvideo(AVFormatContext *s1, const uint8_t *buf1, int size)
                 r = avpriv_find_start_code(r1, end, &start_code);
                 if((start_code & 0xFFFFFF00) == 0x100) {
                     /* New start code found */
-                    if (start_code == 0x100) {
+                    if (start_code == 0x100 && end - r >= 2) {
                         frame_type = (r[1] & 0x38) >> 3;
                         temporal_reference = (int)r[0] << 2 | r[1] >> 6;
                     }

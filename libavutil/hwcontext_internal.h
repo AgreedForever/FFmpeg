@@ -23,6 +23,7 @@
 
 #include "buffer.h"
 #include "hwcontext.h"
+#include "thread.h"
 #include "frame.h"
 #include "pixfmt.h"
 
@@ -41,11 +42,6 @@ typedef struct HWContextType {
      * i.e. AVHWDeviceContext.hwctx
      */
     size_t             device_hwctx_size;
-    /**
-     * size of the private data, i.e.
-     * AVHWDeviceInternal.priv
-     */
-    size_t             device_priv_size;
 
     /**
      * Size of the hardware-specific device configuration.
@@ -58,16 +54,12 @@ typedef struct HWContextType {
      * i.e. AVHWFramesContext.hwctx
      */
     size_t             frames_hwctx_size;
-    /**
-     * size of the private data, i.e.
-     * AVHWFramesInternal.priv
-     */
-    size_t             frames_priv_size;
 
     int              (*device_create)(AVHWDeviceContext *ctx, const char *device,
                                       AVDictionary *opts, int flags);
     int              (*device_derive)(AVHWDeviceContext *dst_ctx,
-                                      AVHWDeviceContext *src_ctx, int flags);
+                                      AVHWDeviceContext *src_ctx,
+                                      AVDictionary *opts, int flags);
 
     int              (*device_init)(AVHWDeviceContext *ctx);
     void             (*device_uninit)(AVHWDeviceContext *ctx);
@@ -80,6 +72,14 @@ typedef struct HWContextType {
     void             (*frames_uninit)(AVHWFramesContext *ctx);
 
     int              (*frames_get_buffer)(AVHWFramesContext *ctx, AVFrame *frame);
+
+    /**
+     * Allocate a buffer of size bytes for av_hwframe_get_transfer_buffer(),
+     * av_buffer_alloc() is used if this is not set or returns NULL.
+     *
+     * @param device_ref the AVBufferRef of the AVHWDeviceContext
+     */
+    AVBufferRef     *(*transfer_buffer_alloc)(void *device_ref, size_t size);
     int              (*transfer_get_formats)(AVHWFramesContext *ctx,
                                              enum AVHWFrameTransferDirection dir,
                                              enum AVPixelFormat **formats);
@@ -99,22 +99,23 @@ typedef struct HWContextType {
                                            AVHWFramesContext *src_ctx, int flags);
 } HWContextType;
 
-struct AVHWDeviceInternal {
-    const HWContextType *hw_type;
-    void                *priv;
-
+typedef struct FFHWFramesContext {
     /**
-     * For a derived device, a reference to the original device
-     * context it was derived from.
+     * The public AVHWFramesContext. See hwcontext.h for it.
      */
-    AVBufferRef *source_device;
-};
+    AVHWFramesContext p;
 
-struct AVHWFramesInternal {
     const HWContextType *hw_type;
-    void                *priv;
 
     AVBufferPool *pool_internal;
+
+    /**
+     * Buffers of transfer_pool_size bytes for av_hwframe_get_transfer_buffer(),
+     * both guarded by transfer_pool_lock.
+     */
+    AVBufferPool *transfer_pool;
+    size_t        transfer_pool_size;
+    AVMutex       transfer_pool_lock;
 
     /**
      * For a derived context, a reference to the original frames
@@ -126,7 +127,12 @@ struct AVHWFramesInternal {
      * frame context when trying to allocate in the derived context.
      */
     int source_allocation_map_flags;
-};
+} FFHWFramesContext;
+
+static inline FFHWFramesContext *ffhwframesctx(AVHWFramesContext *ctx)
+{
+    return (FFHWFramesContext*)ctx;
+}
 
 typedef struct HWMapDescriptor {
     /**
@@ -156,12 +162,25 @@ int ff_hwframe_map_create(AVBufferRef *hwframe_ref,
                                         HWMapDescriptor *hwmap),
                           void *priv);
 
+/**
+ * Replace the current hwmap of dst with the one from src, used for indirect
+ * mappings like VAAPI->(DRM)->OpenCL/Vulkan where a direct interop is missing
+ */
+int ff_hwframe_map_replace(AVFrame *dst, const AVFrame *src);
 
 extern const HWContextType ff_hwcontext_type_cuda;
+extern const HWContextType ff_hwcontext_type_d3d11va;
+extern const HWContextType ff_hwcontext_type_d3d12va;
+extern const HWContextType ff_hwcontext_type_drm;
 extern const HWContextType ff_hwcontext_type_dxva2;
+extern const HWContextType ff_hwcontext_type_opencl;
 extern const HWContextType ff_hwcontext_type_qsv;
 extern const HWContextType ff_hwcontext_type_vaapi;
 extern const HWContextType ff_hwcontext_type_vdpau;
 extern const HWContextType ff_hwcontext_type_videotoolbox;
+extern const HWContextType ff_hwcontext_type_mediacodec;
+extern const HWContextType ff_hwcontext_type_vulkan;
+extern const HWContextType ff_hwcontext_type_amf;
+extern const HWContextType ff_hwcontext_type_oh;
 
 #endif /* AVUTIL_HWCONTEXT_INTERNAL_H */

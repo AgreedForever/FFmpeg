@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "libavutil/common.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
 
 #include "libavformat/avformat.h"
@@ -63,11 +64,11 @@ int main(int argc, char **argv)
     int64_t timestamp;
     AVDictionary *format_opts = NULL;
     int64_t seekfirst = AV_NOPTS_VALUE;
+    int64_t seekfirst_min = AV_NOPTS_VALUE;
     int firstback=0;
     int frame_count = 1;
     int duration = 4;
-
-    ic->flags |= AVFMT_FLAG_KEEP_SIDE_DATA;
+    int seekfirst_stream = -1;
 
     for(i=2; i<argc; i+=2){
         if       (!strcmp(argv[i], "-seekforw")){
@@ -75,6 +76,10 @@ int main(int argc, char **argv)
         } else if(!strcmp(argv[i], "-seekback")){
             seekfirst = atoi(argv[i+1]);
             firstback = 1;
+        } else if(!strcmp(argv[i], "-seekmin")){
+            seekfirst_min = atoi(argv[i+1]);
+        } else if(!strcmp(argv[i], "-stream_id")){
+            seekfirst_stream = atoi(argv[i+1]);
         } else if(!strcmp(argv[i], "-frames")){
             frame_count = atoi(argv[i+1]);
         } else if(!strcmp(argv[i], "-duration")){
@@ -90,11 +95,8 @@ int main(int argc, char **argv)
         }
     }
 
-    av_dict_set(&format_opts, "channels", "1", 0);
+    av_dict_set(&format_opts, "ch_layout", "mono", 0);
     av_dict_set(&format_opts, "sample_rate", "22050", 0);
-
-    /* initialize libavcodec, and register all codecs and formats */
-    av_register_all();
 
     if (argc < 2) {
         printf("usage: %s input_file\n"
@@ -118,8 +120,10 @@ int main(int argc, char **argv)
     }
 
     if(seekfirst != AV_NOPTS_VALUE){
-        if(firstback)   avformat_seek_file(ic, -1, INT64_MIN, seekfirst, seekfirst, 0);
-        else            avformat_seek_file(ic, -1, seekfirst, seekfirst, INT64_MAX, 0);
+        if(firstback)   avformat_seek_file(ic, seekfirst_stream, INT64_MIN, seekfirst, seekfirst, 0);
+        else            avformat_seek_file(ic, seekfirst_stream,
+                                           seekfirst_min != AV_NOPTS_VALUE ? seekfirst_min : seekfirst,
+                                           seekfirst, INT64_MAX, 0);
     }
     for(i=0; ; i++){
         AVPacket pkt = { 0 };
@@ -131,10 +135,15 @@ int main(int argc, char **argv)
             ret= av_read_frame(ic, &pkt);
             if(ret>=0){
                 char dts_buf[60];
+                size_t skip_size;
+                const uint8_t *skip;
                 st= ic->streams[pkt.stream_index];
                 ts_str(dts_buf, pkt.dts, st->time_base);
                 ts_str(ts_buf,  pkt.pts, st->time_base);
                 printf("ret:%-10s st:%2d flags:%d dts:%s pts:%s pos:%7" PRId64 " size:%6d", ret_str(ret), pkt.stream_index, pkt.flags, dts_buf, ts_buf, pkt.pos, pkt.size);
+                skip = av_packet_get_side_data(&pkt, AV_PKT_DATA_SKIP_SAMPLES, &skip_size);
+                if (skip && skip_size >= 8)
+                    printf(" skip:%"PRIu32" discard:%"PRIu32, AV_RL32(skip), AV_RL32(skip + 4));
                 av_packet_unref(&pkt);
             } else
                 printf("ret:%s", ret_str(ret)); // necessary to avoid trailing whitespace

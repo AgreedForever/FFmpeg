@@ -27,6 +27,10 @@
 %define public_prefix  avpriv
 %define cpuflags_mmxext cpuflags_mmx2
 
+%if HAVE_X86_SSE2AVX
+%define FORCE_VEX_ENCODING 1
+%endif
+
 %include "libavutil/x86/x86inc.asm"
 
 ; expands to [base],...,[base+7*stride]
@@ -310,15 +314,6 @@
 %endif
 %endmacro
 
-%macro PSIGNW 2
-%if cpuflag(ssse3)
-    psignw     %1, %2
-%else
-    pxor       %1, %2
-    psubw      %1, %2
-%endif
-%endmacro
-
 %macro ABS1 2
 %if cpuflag(ssse3)
     pabsw   %1, %1
@@ -355,41 +350,6 @@
     psubw      %1, %3
     psubw      %2, %4
 %endif
-%endmacro
-
-%macro ABSB 2 ; source mmreg, temp mmreg (unused for ssse3)
-%if cpuflag(ssse3)
-    pabsb   %1, %1
-%else
-    pxor    %2, %2
-    psubb   %2, %1
-    pminub  %1, %2
-%endif
-%endmacro
-
-%macro ABSB2 4 ; src1, src2, tmp1, tmp2 (tmp1/2 unused for SSSE3)
-%if cpuflag(ssse3)
-    pabsb   %1, %1
-    pabsb   %2, %2
-%else
-    pxor    %3, %3
-    pxor    %4, %4
-    psubb   %3, %1
-    psubb   %4, %2
-    pminub  %1, %3
-    pminub  %2, %4
-%endif
-%endmacro
-
-%macro ABSD2_MMX 4
-    pxor    %3, %3
-    pxor    %4, %4
-    pcmpgtd %3, %1
-    pcmpgtd %4, %2
-    pxor    %1, %3
-    pxor    %2, %4
-    psubd   %1, %3
-    psubd   %2, %4
 %endmacro
 
 %macro ABS4 6
@@ -434,12 +394,7 @@
     paddd   %1, %2
 %endif
 %if notcpuflag(xop) || sizeof%1 != 16
-%if cpuflag(mmxext)
-    PSHUFLW %2, %1, q0032
-%else ; mmx
-    mova    %2, %1
-    psrlq   %2, 32
-%endif
+    pshuflw %2, %1, q0032
     paddd   %1, %2
 %endif
 %undef %1
@@ -475,7 +430,7 @@
 %else
     palignr %1, %2, %3
 %endif
-%elif cpuflag(mmx) ; [dst,] src1, src2, imm, tmp
+%else ; [dst,] src1, src2, imm, tmp
     %define %%dst %1
 %if %0==5
 %ifnidn %1, %2
@@ -494,42 +449,6 @@
     psrldq  %4, %3
 %endif
     por     %%dst, %4
-%endif
-%endmacro
-
-%macro PAVGB 2-4
-%if cpuflag(mmxext)
-    pavgb   %1, %2
-%elif cpuflag(3dnow)
-    pavgusb %1, %2
-%elif cpuflag(mmx)
-    movu   %3, %2
-    por    %3, %1
-    pxor   %1, %2
-    pand   %1, %4
-    psrlq  %1, 1
-    psubb  %3, %1
-    SWAP   %1, %3
-%endif
-%endmacro
-
-%macro PSHUFLW 1+
-    %if mmsize == 8
-        pshufw %1
-    %else
-        pshuflw %1
-    %endif
-%endmacro
-
-%macro PSWAPD 2
-%if cpuflag(mmxext)
-    pshufw    %1, %2, q1032
-%elif cpuflag(3dnowext)
-    pswapd    %1, %2
-%elif cpuflag(3dnow)
-    movq      %1, %2
-    psrlq     %1, 32
-    punpckldq %1, %2
 %endif
 %endmacro
 
@@ -744,16 +663,6 @@
     movh  [%7+%8], %4
 %endmacro
 
-%macro PMINUB 3 ; dst, src, ignored
-%if cpuflag(mmxext)
-    pminub   %1, %2
-%else ; dst, src, tmp
-    mova     %3, %1
-    psubusb  %3, %2
-    psubb    %1, %3
-%endif
-%endmacro
-
 %macro SPLATW 2-3 0
 %if cpuflag(avx2) && %3 == 0
     vpbroadcastw %1, %2
@@ -799,47 +708,64 @@
     pminsw %1, %3
 %endmacro
 
-%macro PMINSD_MMX 3 ; dst, src, tmp
+%macro PMINSD 3 ; dst, src, tmp/unused
+%if cpuflag(sse4)
+    pminsd    %1, %2
+%else
     mova      %3, %2
     pcmpgtd   %3, %1
     pxor      %1, %2
     pand      %1, %3
     pxor      %1, %2
+%endif
 %endmacro
 
-%macro PMAXSD_MMX 3 ; dst, src, tmp
+%macro PMAXSD 3 ; dst, src, tmp/unused
+%if cpuflag(sse4)
+    pmaxsd    %1, %2
+%else
     mova      %3, %1
     pcmpgtd   %3, %2
     pand      %1, %3
     pandn     %3, %2
     por       %1, %3
+%endif
 %endmacro
 
-%macro CLIPD_MMX 3-4 ; src/dst, min, max, tmp
-    PMINSD_MMX %1, %3, %4
-    PMAXSD_MMX %1, %2, %4
-%endmacro
-
-%macro CLIPD_SSE2 3-4 ; src/dst, min (float), max (float), unused
+%macro CLIPD 3-4
+%if cpuflag(sse4);  src/dst, min, max, unused
+    pminsd  %1, %3
+    pmaxsd  %1, %2
+%elif cpuflag(sse2) ; src/dst, min (float), max (float), unused
     cvtdq2ps  %1, %1
     minps     %1, %3
     maxps     %1, %2
     cvtps2dq  %1, %1
-%endmacro
-
-%macro CLIPD_SSE41 3-4 ;  src/dst, min, max, unused
-    pminsd  %1, %3
-    pmaxsd  %1, %2
-%endmacro
-
-%macro VBROADCASTSS 2 ; dst xmm/ymm, src m32
-%if cpuflag(avx)
-    vbroadcastss %1, %2
-%else ; sse
-%ifnidn %1, %2
-    movss        %1, %2
+%else               ; src/dst, min, max, tmp
+    PMINSD    %1, %3, %4
+    PMAXSD    %1, %2, %4
 %endif
-    shufps       %1, %1, 0
+%endmacro
+
+%macro VBROADCASTSS 2 ; dst xmm/ymm, src m32/xmm
+%if cpuflag(avx2)
+    vbroadcastss  %1, %2
+%elif cpuflag(avx)
+    %ifnum sizeof%2         ; avx1 register
+        shufps  xmm%1, xmm%2, xmm%2, q0000
+        %if sizeof%1 >= 32  ; mmsize>=32
+            vinsertf128  %1, %1, xmm%1, 1
+        %endif
+    %else                   ; avx1 memory
+        vbroadcastss  %1, %2
+    %endif
+%else
+    %ifnum sizeof%2         ; sse register
+        shufps  %1, %2, %2, q0000
+    %else                   ; sse memory
+        movss   %1, %2
+        shufps  %1, %1, 0
+    %endif
 %endif
 %endmacro
 
@@ -851,6 +777,29 @@
 %else ; sse2
     movsd        %1, %2
     movlhps      %1, %1
+%endif
+%endmacro
+
+%macro VPBROADCASTD 2 ; dst xmm/ymm, src m32/xmm
+%if cpuflag(avx2)
+    vpbroadcastd  %1, %2
+%elif cpuflag(avx) && sizeof%1 >= 32
+    %error vpbroadcastd not possible with ymm on avx1. try vbroadcastss
+%else
+    %ifnum sizeof%2         ; sse2 register
+        pshufd  %1, %2, q0000
+    %else                   ; sse memory
+        movd    %1, %2
+        pshufd  %1, %1, 0
+    %endif
+%endif
+%endmacro
+
+%macro VBROADCASTI128 2 ; dst xmm/ymm, src : 128bits val
+%if mmsize > 16
+    vbroadcasti128 %1, %2
+%else
+    mova           %1, %2
 %endif
 %endmacro
 
@@ -891,22 +840,6 @@
     %endif
 %endmacro
 
-%macro LSHIFT 2
-%if mmsize > 8
-    pslldq  %1, %2
-%else
-    psllq   %1, 8*(%2)
-%endif
-%endmacro
-
-%macro RSHIFT 2
-%if mmsize > 8
-    psrldq  %1, %2
-%else
-    psrlq   %1, 8*(%2)
-%endif
-%endmacro
-
 %macro MOVHL 2 ; dst, src
 %ifidn %1, %2
     punpckhqdq %1, %2
@@ -918,3 +851,79 @@
     movhlps    %1, %2        ; may cause an int/float domain transition and has a dependency on dst
 %endif
 %endmacro
+
+; Horizontal Sum of Packed Single precision floats
+; The resulting sum is in all elements.
+%macro HSUMPS 2 ; dst/src, tmp
+%if cpuflag(avx)
+    %if sizeof%1>=32  ; avx
+        vperm2f128  %2, %1, %1, (0)*16+(1)
+        addps       %1, %2
+    %endif
+    shufps      %2, %1, %1, q1032
+    addps       %1, %2
+    shufps      %2, %1, %1, q0321
+    addps       %1, %2
+%else  ; this form is a bit faster than the short avx-like emulation.
+    movaps      %2, %1
+    shufps      %1, %1, q1032
+    addps       %1, %2
+    movaps      %2, %1
+    shufps      %1, %1, q0321
+    addps       %1, %2
+    ; all %1 members should be equal for as long as float a+b==b+a
+%endif
+%endmacro
+
+; Emulate blendvps if not available
+;
+; src_b is destroyed when using emulation with logical operands
+; SSE41 blendv instruction is hard coded to use xmm0 as mask
+%macro BLENDVPS 3 ; dst/src_a, src_b, mask
+%if cpuflag(avx)
+    blendvps  %1, %1, %2, %3
+%elif cpuflag(sse4)
+    %ifnidn %3,xmm0
+        %error sse41 blendvps uses xmm0 as default 3d operand, you used %3
+    %endif
+    blendvps  %1, %2, %3
+%else
+    xorps  %2, %1
+    andps  %2, %3
+    xorps  %1, %2
+%endif
+%endmacro
+
+; Emulate pblendvb if not available
+;
+; src_b is destroyed when using emulation with logical operands
+; SSE41 blendv instruction is hard coded to use xmm0 as mask
+%macro PBLENDVB 3 ; dst/src_a, src_b, mask
+%if cpuflag(avx)
+    %if cpuflag(avx) && notcpuflag(avx2) && sizeof%1 >= 32
+        %error pblendb not possible with ymm on avx1, try blendvps.
+    %endif
+    pblendvb  %1, %1, %2, %3
+%elif cpuflag(sse4)
+    %ifnidn %3,xmm0
+        %error sse41 pblendvd uses xmm0 as default 3d operand, you used %3
+    %endif
+    pblendvb  %1, %2, %3
+%else
+    pxor  %2, %1
+    pand  %2, %3
+    pxor  %1, %2
+%endif
+%endmacro
+
+; NASM panics when emitting CodeView debug info for an empty translation unit.
+; GNU binutils `strip` and some other tools such as older MSVC linker also fail
+; on such files. Emit a dummy byte in a section with IMAGE_SCN_LNK_REMOVE flag
+; to work around these issues. Sections like that are dropped by the linker.
+%ifidn __OUTPUT_FORMAT__,win64
+    section .x86util info
+        db 0
+%elifidn __OUTPUT_FORMAT__,win32
+    section .x86util info
+        db 0
+%endif

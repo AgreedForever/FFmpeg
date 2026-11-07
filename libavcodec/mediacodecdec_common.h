@@ -25,6 +25,7 @@
 
 #include <stdint.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <sys/types.h>
 
 #include "libavutil/frame.h"
@@ -35,12 +36,19 @@
 
 typedef struct MediaCodecDecContext {
 
+    AVCodecContext *avctx;
     atomic_int refcount;
+    atomic_int hw_buffer_count;
 
     char *codec_name;
 
     FFAMediaCodec *codec;
     FFAMediaFormat *format;
+    /* Set once the codec has signalled an output format or produced output.
+     * Until then format is the one set up at configure time and its stream
+     * info is not applied.
+     */
+    bool has_output_format;
 
     void *surface;
 
@@ -54,14 +62,20 @@ typedef struct MediaCodecDecContext {
     int stride;
     int slice_height;
     int color_format;
-    enum AVPixelFormat pix_fmt;
     int crop_top;
     int crop_bottom;
     int crop_left;
     int crop_right;
+    int display_width;
+    int display_height;
 
     uint64_t output_buffer_count;
+    ssize_t current_input_buffer;
 
+    bool delay_flush;
+    atomic_int serial;
+
+    bool use_ndk_codec;
 } MediaCodecDecContext;
 
 int ff_mediacodec_dec_init(AVCodecContext *avctx,
@@ -69,11 +83,15 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx,
                            const char *mime,
                            FFAMediaFormat *format);
 
-int ff_mediacodec_dec_decode(AVCodecContext *avctx,
-                             MediaCodecDecContext *s,
-                             AVFrame *frame,
-                             int *got_frame,
-                             AVPacket *pkt);
+int ff_mediacodec_dec_send(AVCodecContext *avctx,
+                           MediaCodecDecContext *s,
+                           AVPacket *pkt,
+                           bool wait);
+
+int ff_mediacodec_dec_receive(AVCodecContext *avctx,
+                              MediaCodecDecContext *s,
+                              AVFrame *frame,
+                              bool wait);
 
 int ff_mediacodec_dec_flush(AVCodecContext *avctx,
                             MediaCodecDecContext *s);
@@ -90,6 +108,7 @@ typedef struct MediaCodecBuffer {
     ssize_t index;
     int64_t pts;
     atomic_int released;
+    int serial;
 
 } MediaCodecBuffer;
 

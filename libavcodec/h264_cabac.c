@@ -31,12 +31,9 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
-#include "libavutil/timer.h"
 #include "config.h"
 #include "cabac.h"
 #include "cabac_functions.h"
-#include "internal.h"
-#include "avcodec.h"
 #include "h264dec.h"
 #include "h264data.h"
 #include "h264_mvpred.h"
@@ -44,6 +41,8 @@
 
 #if ARCH_X86
 #include "x86/h264_cabac.c"
+#elif ARCH_LOONGARCH64
+#include "loongarch/h264_cabac.c"
 #endif
 
 /* Cabac pre state table */
@@ -1281,6 +1280,15 @@ void ff_h264_init_cabac_states(const H264Context *h, H264SliceContext *sl)
     }
 }
 
+static av_always_inline uint16_t pack8to16(unsigned a, unsigned b)
+{
+#if HAVE_BIGENDIAN
+    return (b & 0xFF) + (a << 8);
+#else
+    return (a & 0xFF) + (b << 8);
+#endif
+}
+
 static int decode_cabac_field_decoding_flag(const H264Context *h, H264SliceContext *sl)
 {
     const int mbb_xy = sl->mb_xy - 2*h->mb_stride;
@@ -1735,7 +1743,7 @@ decode_cabac_residual_internal(const H264Context *h, H264SliceContext *sl,
 \
             if( coeff_abs >= 15 ) { \
                 int j = 0; \
-                while (get_cabac_bypass(CC) && j < 30) { \
+                while (get_cabac_bypass(CC) && j < 16+7) { \
                     j++; \
                 } \
 \
@@ -1895,9 +1903,7 @@ static av_always_inline void decode_cabac_luma_residual(const H264Context *h, H2
                     qmul = h->ps.pps->dequant4_coeff[cqm][qscale];
                     for( i4x4 = 0; i4x4 < 4; i4x4++ ) {
                         const int index = 16*p + 4*i8x8 + i4x4;
-//START_TIMER
                         decode_cabac_residual_nondc(h, sl, sl->mb + (16*index << pixel_shift), ctx_cat[2][p], index, scan, qmul, 16);
-//STOP_TIMER("decode_residual")
                     }
                 }
             } else {
@@ -1916,8 +1922,8 @@ int ff_h264_decode_mb_cabac(const H264Context *h, H264SliceContext *sl)
     const SPS *sps = h->ps.sps;
     int mb_xy;
     int mb_type, partition_count, cbp = 0;
-    int dct8x8_allowed= h->ps.pps->transform_8x8_mode;
-    int decode_chroma = sps->chroma_format_idc == 1 || sps->chroma_format_idc == 2;
+    int dct8x8_allowed = h->ps.pps->transform_8x8_mode;
+    const int decode_chroma = sps->chroma_format_idc == 1 || sps->chroma_format_idc == 2;
     const int pixel_shift = h->pixel_shift;
 
     mb_xy = sl->mb_xy = sl->mb_x + sl->mb_y*h->mb_stride;
@@ -2012,8 +2018,6 @@ int ff_h264_decode_mb_cabac(const H264Context *h, H264SliceContext *sl)
         }
     } else {
         mb_type = decode_cabac_intra_mb_type(sl, 3, 1);
-        if (sl->slice_type == AV_PICTURE_TYPE_SI && mb_type)
-            mb_type--;
         av_assert2(sl->slice_type_nos == AV_PICTURE_TYPE_I);
 decode_intra_mb:
         partition_count = 0;
@@ -2347,7 +2351,7 @@ decode_intra_mb:
     if (CHROMA444(h) && IS_8x8DCT(mb_type)){
         int i;
         uint8_t *nnz_cache = sl->non_zero_count_cache;
-        if (h->sei.unregistered.x264_build < 151U) {
+        if (h->x264_build < 151U) {
             for (i = 0; i < 2; i++){
                 if (sl->left_type[LEFT(i)] && !IS_8x8DCT(sl->left_type[LEFT(i)])) {
                     nnz_cache[3+8* 1 + 2*8*i]=

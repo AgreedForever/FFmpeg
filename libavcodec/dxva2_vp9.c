@@ -20,15 +20,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/avassert.h"
 #include "libavutil/pixdesc.h"
 
-#include "vp9shared.h"
-
-// The headers above may include w32threads.h, which uses the original
-// _WIN32_WINNT define, while dxva2_internal.h redefines it to target a
-// potentially newer version.
 #include "dxva2_internal.h"
+#include "hwaccel_internal.h"
+#include "vp9shared.h"
 
 struct vp9_dxva2_picture_context {
     DXVA_PicParams_VP9    pp;
@@ -44,18 +43,17 @@ static void fill_picture_entry(DXVA_PicEntry_VPx *pic,
     pic->bPicEntry = index | (flag << 7);
 }
 
-static int fill_picture_parameters(const AVCodecContext *avctx, AVDXVAContext *ctx, const VP9SharedContext *h,
+int ff_dxva2_vp9_fill_picture_parameters(const AVCodecContext *avctx, AVDXVAContext *ctx,
                                     DXVA_PicParams_VP9 *pp)
 {
+    const VP9SharedContext   *h       = avctx->priv_data;
+    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(avctx->sw_pix_fmt);
     int i;
-    const AVPixFmtDescriptor * pixdesc = av_pix_fmt_desc_get(avctx->sw_pix_fmt);
 
     if (!pixdesc)
         return -1;
 
     memset(pp, 0, sizeof(*pp));
-
-    fill_picture_entry(&pp->CurrPic, ff_dxva2_get_surface_index(avctx, ctx, h->frames[CUR_FRAME].tf.f), 0);
 
     pp->profile = h->h.profile;
     pp->wFormatAndPictureInfoFlags = ((h->h.keyframe == 0)   <<  0) |
@@ -81,8 +79,8 @@ static int fill_picture_parameters(const AVCodecContext *avctx, AVDXVAContext *c
     pp->Reserved8Bits = 0;
 
     for (i = 0; i < 8; i++) {
-        if (h->refs[i].f->buf[0]) {
-            fill_picture_entry(&pp->ref_frame_map[i], ff_dxva2_get_surface_index(avctx, ctx, h->refs[i].f), 0);
+        if (h->refs[i].f) {
+            fill_picture_entry(&pp->ref_frame_map[i], ff_dxva2_get_surface_index(avctx, ctx, h->refs[i].f, 0), 0);
             pp->ref_frame_coded_width[i]  = h->refs[i].f->width;
             pp->ref_frame_coded_height[i] = h->refs[i].f->height;
         } else
@@ -91,13 +89,15 @@ static int fill_picture_parameters(const AVCodecContext *avctx, AVDXVAContext *c
 
     for (i = 0; i < 3; i++) {
         uint8_t refidx = h->h.refidx[i];
-        if (h->refs[refidx].f->buf[0])
-            fill_picture_entry(&pp->frame_refs[i], ff_dxva2_get_surface_index(avctx, ctx, h->refs[refidx].f), 0);
+        if (h->refs[refidx].f)
+            fill_picture_entry(&pp->frame_refs[i], ff_dxva2_get_surface_index(avctx, ctx, h->refs[refidx].f, 0), 0);
         else
             pp->frame_refs[i].bPicEntry = 0xFF;
 
         pp->ref_frame_sign_bias[i + 1] = h->h.signbias[i];
     }
+
+    fill_picture_entry(&pp->CurrPic, ff_dxva2_get_surface_index(avctx, ctx, h->frames[CUR_FRAME].tf.f, 1), 0);
 
     pp->filter_level    = h->h.filter.level;
     pp->sharpness_level = h->h.filter.sharpness;
@@ -170,16 +170,16 @@ static int commit_bitstream_and_slice_buffer(AVCodecContext *avctx,
                                              DECODER_BUFFER_DESC *sc)
 {
     const VP9SharedContext *h = avctx->priv_data;
-    AVDXVAContext *ctx = avctx->hwaccel_context;
+    AVDXVAContext *ctx = DXVA_CONTEXT(avctx);
     struct vp9_dxva2_picture_context *ctx_pic = h->frames[CUR_FRAME].hwaccel_picture_private;
-    void     *dxva_data_ptr;
+    void     *dxva_data_ptr = NULL;
     uint8_t  *dxva_data;
     unsigned dxva_size;
     unsigned padding;
     unsigned type;
 
 #if CONFIG_D3D11VA
-    if (avctx->pix_fmt == AV_PIX_FMT_D3D11VA_VLD) {
+    if (ff_dxva2_is_d3d11(avctx)) {
         type = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
         if (FAILED(ID3D11VideoContext_GetDecoderBuffer(D3D11VA_CONTEXT(ctx)->video_context,
                                                        D3D11VA_CONTEXT(ctx)->decoder,
@@ -200,7 +200,7 @@ static int commit_bitstream_and_slice_buffer(AVCodecContext *avctx,
 
     dxva_data = dxva_data_ptr;
 
-    if (ctx_pic->slice.SliceBytesInBuffer > dxva_size) {
+    if (!dxva_data || ctx_pic->slice.SliceBytesInBuffer > dxva_size) {
         av_log(avctx, AV_LOG_ERROR, "Failed to build bitstream");
         return -1;
     }
@@ -214,7 +214,7 @@ static int commit_bitstream_and_slice_buffer(AVCodecContext *avctx,
     }
 
 #if CONFIG_D3D11VA
-    if (avctx->pix_fmt == AV_PIX_FMT_D3D11VA_VLD)
+    if (ff_dxva2_is_d3d11(avctx))
         if (FAILED(ID3D11VideoContext_ReleaseDecoderBuffer(D3D11VA_CONTEXT(ctx)->video_context, D3D11VA_CONTEXT(ctx)->decoder, type)))
             return -1;
 #endif
@@ -225,7 +225,7 @@ static int commit_bitstream_and_slice_buffer(AVCodecContext *avctx,
 #endif
 
 #if CONFIG_D3D11VA
-    if (avctx->pix_fmt == AV_PIX_FMT_D3D11VA_VLD) {
+    if (ff_dxva2_is_d3d11(avctx)) {
         D3D11_VIDEO_DECODER_BUFFER_DESC *dsc11 = bs;
         memset(dsc11, 0, sizeof(*dsc11));
         dsc11->BufferType           = type;
@@ -254,11 +254,12 @@ static int commit_bitstream_and_slice_buffer(AVCodecContext *avctx,
 
 
 static int dxva2_vp9_start_frame(AVCodecContext *avctx,
+                                 av_unused const AVBufferRef *buffer_ref,
                                  av_unused const uint8_t *buffer,
                                  av_unused uint32_t size)
 {
     const VP9SharedContext *h = avctx->priv_data;
-    AVDXVAContext *ctx = avctx->hwaccel_context;
+    AVDXVAContext *ctx = DXVA_CONTEXT(avctx);
     struct vp9_dxva2_picture_context *ctx_pic = h->frames[CUR_FRAME].hwaccel_picture_private;
 
     if (!DXVA_CONTEXT_VALID(avctx, ctx))
@@ -266,7 +267,7 @@ static int dxva2_vp9_start_frame(AVCodecContext *avctx,
     av_assert0(ctx_pic);
 
     /* Fill up DXVA_PicParams_VP9 */
-    if (fill_picture_parameters(avctx, ctx, h, &ctx_pic->pp) < 0)
+    if (ff_dxva2_vp9_fill_picture_parameters(avctx, ctx, &ctx_pic->pp) < 0)
         return -1;
 
     ctx_pic->bitstream_size = 0;
@@ -309,27 +310,52 @@ static int dxva2_vp9_end_frame(AVCodecContext *avctx)
 }
 
 #if CONFIG_VP9_DXVA2_HWACCEL
-AVHWAccel ff_vp9_dxva2_hwaccel = {
-    .name           = "vp9_dxva2",
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_VP9,
-    .pix_fmt        = AV_PIX_FMT_DXVA2_VLD,
+const FFHWAccel ff_vp9_dxva2_hwaccel = {
+    .p.name         = "vp9_dxva2",
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_VP9,
+    .p.pix_fmt      = AV_PIX_FMT_DXVA2_VLD,
+    .init           = ff_dxva2_decode_init,
+    .uninit         = ff_dxva2_decode_uninit,
     .start_frame    = dxva2_vp9_start_frame,
     .decode_slice   = dxva2_vp9_decode_slice,
     .end_frame      = dxva2_vp9_end_frame,
+    .frame_params   = ff_dxva2_common_frame_params,
     .frame_priv_data_size = sizeof(struct vp9_dxva2_picture_context),
+    .priv_data_size = sizeof(FFDXVASharedContext),
 };
 #endif
 
 #if CONFIG_VP9_D3D11VA_HWACCEL
-AVHWAccel ff_vp9_d3d11va_hwaccel = {
-    .name           = "vp9_d3d11va",
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_VP9,
-    .pix_fmt        = AV_PIX_FMT_D3D11VA_VLD,
+const FFHWAccel ff_vp9_d3d11va_hwaccel = {
+    .p.name         = "vp9_d3d11va",
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_VP9,
+    .p.pix_fmt      = AV_PIX_FMT_D3D11VA_VLD,
+    .init           = ff_dxva2_decode_init,
+    .uninit         = ff_dxva2_decode_uninit,
     .start_frame    = dxva2_vp9_start_frame,
     .decode_slice   = dxva2_vp9_decode_slice,
     .end_frame      = dxva2_vp9_end_frame,
+    .frame_params   = ff_dxva2_common_frame_params,
     .frame_priv_data_size = sizeof(struct vp9_dxva2_picture_context),
+    .priv_data_size = sizeof(FFDXVASharedContext),
+};
+#endif
+
+#if CONFIG_VP9_D3D11VA2_HWACCEL
+const FFHWAccel ff_vp9_d3d11va2_hwaccel = {
+    .p.name         = "vp9_d3d11va2",
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_VP9,
+    .p.pix_fmt      = AV_PIX_FMT_D3D11,
+    .init           = ff_dxva2_decode_init,
+    .uninit         = ff_dxva2_decode_uninit,
+    .start_frame    = dxva2_vp9_start_frame,
+    .decode_slice   = dxva2_vp9_decode_slice,
+    .end_frame      = dxva2_vp9_end_frame,
+    .frame_params   = ff_dxva2_common_frame_params,
+    .frame_priv_data_size = sizeof(struct vp9_dxva2_picture_context),
+    .priv_data_size = sizeof(FFDXVASharedContext),
 };
 #endif

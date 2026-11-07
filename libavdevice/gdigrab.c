@@ -29,9 +29,12 @@
  */
 
 #include "config.h"
+#include "libavformat/demux.h"
 #include "libavformat/internal.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
+#include "libavutil/wchar_filename.h"
 #include <windows.h>
 
 /**
@@ -61,7 +64,10 @@ struct gdigrab {
     void      *buffer;      /**< The buffer containing the bitmap image data */
     RECT       clip_rect;   /**< The subarea of the screen or window to clip */
 
-    HWND       region_hwnd; /**< Handle of the region border window */
+    HANDLE        region_thread;    /**< Region window thread */
+    DWORD         region_thread_id; /**< Region window thread ID */
+    HANDLE        region_init;      /**< Region window ready signal */
+    volatile LONG region_result;    /**< Region window status, 0 success */
 
     int cursor_error_printed;
 };
@@ -111,22 +117,25 @@ gdigrab_region_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 }
 
 /**
- * Initialize the region outline window.
+ * Run the region outline window loop.
  *
- * @param s1 The format context.
- * @param gdigrab gdigrab context.
- * @return 0 success, !0 failure
+ * @param opaque gdigrab context.
+ * @return 0
  */
-static int
-gdigrab_region_wnd_init(AVFormatContext *s1, struct gdigrab *gdigrab)
+static DWORD WINAPI
+gdigrab_region_wnd_task(LPVOID opaque)
 {
+    struct gdigrab *gdigrab = opaque;
+
     HWND hwnd;
     RECT rect = gdigrab->clip_rect;
     HRGN region = NULL;
     HRGN region_interior = NULL;
+    MSG msg;
 
     DWORD style = WS_POPUP | WS_VISIBLE;
-    DWORD ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
+    DWORD ex = WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
+        WS_EX_TOPMOST | WS_EX_TRANSPARENT;
 
     rect.left -= REGION_WND_BORDER; rect.top -= REGION_WND_BORDER;
     rect.right += REGION_WND_BORDER; rect.bottom += REGION_WND_BORDER;
@@ -139,7 +148,8 @@ gdigrab_region_wnd_init(AVFormatContext *s1, struct gdigrab *gdigrab)
             rect.right - rect.left, rect.bottom - rect.top,
             NULL, NULL, NULL, NULL);
     if (!hwnd) {
-        WIN32_API_ERROR("Could not create region display window");
+        av_log(NULL, AV_LOG_ERROR, "Could not create region display window "
+            "(error %li)\n", GetLastError());
         goto error;
     }
 
@@ -152,7 +162,8 @@ gdigrab_region_wnd_init(AVFormatContext *s1, struct gdigrab *gdigrab)
             rect.bottom - rect.top - REGION_WND_BORDER);
     CombineRgn(region, region, region_interior, RGN_DIFF);
     if (!SetWindowRgn(hwnd, region, FALSE)) {
-        WIN32_API_ERROR("Could not set window region");
+        av_log(NULL, AV_LOG_ERROR, "Could not set window region "
+            "(error %li)\n", GetLastError());
         goto error;
     }
     // The "region" memory is now owned by the window
@@ -160,11 +171,18 @@ gdigrab_region_wnd_init(AVFormatContext *s1, struct gdigrab *gdigrab)
     DeleteObject(region_interior);
 
     SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR) gdigrab_region_wnd_proc);
+    SetLayeredWindowAttributes(hwnd, 0, 0xFF, LWA_ALPHA);
 
     ShowWindow(hwnd, SW_SHOW);
 
-    gdigrab->region_hwnd = hwnd;
+    InterlockedExchange(&gdigrab->region_result, 0);
+    SetEvent(gdigrab->region_init);
 
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        DispatchMessage(&msg);
+    }
+
+    DestroyWindow(hwnd);
     return 0;
 
 error:
@@ -174,7 +192,44 @@ error:
         DeleteObject(region_interior);
     if (hwnd)
         DestroyWindow(hwnd);
-    return 1;
+    InterlockedExchange(&gdigrab->region_result, AVERROR(EIO));
+    SetEvent(gdigrab->region_init);
+    return 0;
+}
+
+/**
+ * Start the region outline window thread.
+ *
+ * @param gdigrab gdigrab context.
+ * @return 0 success, !0 failure
+ */
+static int
+gdigrab_region_wnd_init(struct gdigrab *gdigrab)
+{
+    int result = AVERROR(EIO);
+
+    /* Start the thread and wait for it to try creating a window */
+    gdigrab->region_result = 0;
+    gdigrab->region_init = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!gdigrab->region_init)
+        goto end;
+    gdigrab->region_thread = CreateThread(NULL, 0, gdigrab_region_wnd_task,
+        gdigrab, 0, &gdigrab->region_thread_id);
+    if (!gdigrab->region_thread)
+        goto end;
+
+    WaitForSingleObject(gdigrab->region_init, INFINITE);
+    result = gdigrab->region_result;
+
+ end:
+    if (gdigrab->region_thread && result < 0) {
+        WaitForSingleObject(gdigrab->region_thread, INFINITE);
+        CloseHandle(gdigrab->region_thread);
+    }
+    if (gdigrab->region_init) {
+        CloseHandle(gdigrab->region_init);
+    }
+    return result;
 }
 
 /**
@@ -186,30 +241,9 @@ error:
 static void
 gdigrab_region_wnd_destroy(AVFormatContext *s1, struct gdigrab *gdigrab)
 {
-    if (gdigrab->region_hwnd)
-        DestroyWindow(gdigrab->region_hwnd);
-    gdigrab->region_hwnd = NULL;
-}
-
-/**
- * Process the Windows message queue.
- *
- * This is important to prevent Windows from thinking the window has become
- * unresponsive. As well, things like WM_PAINT (to actually draw the window
- * contents) are handled from the message queue context.
- *
- * @param s1 The format context.
- * @param gdigrab gdigrab context.
- */
-static void
-gdigrab_region_wnd_update(AVFormatContext *s1, struct gdigrab *gdigrab)
-{
-    HWND hwnd = gdigrab->region_hwnd;
-    MSG msg;
-
-    while (PeekMessage(&msg, hwnd, 0, 0, PM_REMOVE)) {
-        DispatchMessage(&msg);
-    }
+    PostThreadMessage(gdigrab->region_thread_id, WM_QUIT, 0, 0);
+    WaitForSingleObject(gdigrab->region_thread, INFINITE);
+    CloseHandle(gdigrab->region_thread);
 }
 
 /**
@@ -230,12 +264,14 @@ gdigrab_read_header(AVFormatContext *s1)
     HBITMAP hbmp   = NULL;
     void *buffer   = NULL;
 
-    const char *filename = s1->filename;
+    const char *filename = s1->url;
     const char *name     = NULL;
     AVStream   *st       = NULL;
 
     int bpp;
+    int horzres;
     int vertres;
+    int desktophorzres;
     int desktopvertres;
     RECT virtual_rect;
     RECT clip_rect;
@@ -243,8 +279,20 @@ gdigrab_read_header(AVFormatContext *s1)
     int ret;
 
     if (!strncmp(filename, "title=", 6)) {
+        wchar_t *name_w = NULL;
         name = filename + 6;
-        hwnd = FindWindow(NULL, name);
+
+        if(utf8towchar(name, &name_w)) {
+            ret = AVERROR(errno);
+            goto error;
+        }
+        if(!name_w) {
+            ret = AVERROR(EINVAL);
+            goto error;
+        }
+
+        hwnd = FindWindowW(NULL, name_w);
+        av_freep(&name_w);
         if (!hwnd) {
             av_log(s1, AV_LOG_ERROR,
                    "Can't find window '%s', aborting.\n", name);
@@ -258,9 +306,22 @@ gdigrab_read_header(AVFormatContext *s1)
         }
     } else if (!strcmp(filename, "desktop")) {
         hwnd = NULL;
+    } else if (!strncmp(filename, "hwnd=", 5)) {
+        char *p;
+        name = filename + 5;
+
+        hwnd = (HWND)(intptr_t) strtoull(name, &p, 0);
+
+        if (p == NULL || p == name || p[0] != '\0')
+        {
+            av_log(s1, AV_LOG_ERROR,
+                   "Invalid window handle '%s', must be a valid integer.\n", name);
+            ret = AVERROR(EINVAL);
+            goto error;
+        }
     } else {
         av_log(s1, AV_LOG_ERROR,
-               "Please use \"desktop\" or \"title=<windowname>\" to specify your target.\n");
+               "Please use \"desktop\", \"title=<windowname>\" or \"hwnd=<hwnd>\" to specify your target.\n");
         ret = AVERROR(EIO);
         goto error;
     }
@@ -275,15 +336,23 @@ gdigrab_read_header(AVFormatContext *s1)
     }
     bpp = GetDeviceCaps(source_hdc, BITSPIXEL);
 
+    horzres = GetDeviceCaps(source_hdc, HORZRES);
+    vertres = GetDeviceCaps(source_hdc, VERTRES);
+    desktophorzres = GetDeviceCaps(source_hdc, DESKTOPHORZRES);
+    desktopvertres = GetDeviceCaps(source_hdc, DESKTOPVERTRES);
+
     if (hwnd) {
         GetClientRect(hwnd, &virtual_rect);
+        /* window -- get the right height and width for scaling DPI */
+        virtual_rect.left   = virtual_rect.left   * desktophorzres / horzres;
+        virtual_rect.right  = virtual_rect.right  * desktophorzres / horzres;
+        virtual_rect.top    = virtual_rect.top    * desktopvertres / vertres;
+        virtual_rect.bottom = virtual_rect.bottom * desktopvertres / vertres;
     } else {
         /* desktop -- get the right height and width for scaling DPI */
-        vertres = GetDeviceCaps(source_hdc, VERTRES);
-        desktopvertres = GetDeviceCaps(source_hdc, DESKTOPVERTRES);
         virtual_rect.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
         virtual_rect.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        virtual_rect.right = (virtual_rect.left + GetSystemMetrics(SM_CXVIRTUALSCREEN)) * desktopvertres / vertres;
+        virtual_rect.right = (virtual_rect.left + GetSystemMetrics(SM_CXVIRTUALSCREEN)) * desktophorzres / horzres;
         virtual_rect.bottom = (virtual_rect.top + GetSystemMetrics(SM_CYVIRTUALSCREEN)) * desktopvertres / vertres;
     }
 
@@ -384,7 +453,7 @@ gdigrab_read_header(AVFormatContext *s1)
     gdigrab->header_size = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) +
                            (bpp <= 8 ? (1 << bpp) : 0) * sizeof(RGBQUAD) /* palette size */;
     gdigrab->time_base   = av_inv_q(gdigrab->framerate);
-    gdigrab->time_frame  = av_gettime() / av_q2d(gdigrab->time_base);
+    gdigrab->time_frame  = av_gettime_relative() / av_q2d(gdigrab->time_base);
 
     gdigrab->hwnd       = hwnd;
     gdigrab->source_hdc = source_hdc;
@@ -397,7 +466,7 @@ gdigrab_read_header(AVFormatContext *s1)
     gdigrab->cursor_error_printed = 0;
 
     if (gdigrab->show_region) {
-        if (gdigrab_region_wnd_init(s1, gdigrab)) {
+        if (gdigrab_region_wnd_init(gdigrab)) {
             ret = AVERROR(EIO);
             goto error;
         }
@@ -447,7 +516,9 @@ static void paint_mouse_pointer(AVFormatContext *s1, struct gdigrab *gdigrab)
         POINT pos;
         RECT clip_rect = gdigrab->clip_rect;
         HWND hwnd = gdigrab->hwnd;
+        int horzres = GetDeviceCaps(gdigrab->source_hdc, HORZRES);
         int vertres = GetDeviceCaps(gdigrab->source_hdc, VERTRES);
+        int desktophorzres = GetDeviceCaps(gdigrab->source_hdc, DESKTOPHORZRES);
         int desktopvertres = GetDeviceCaps(gdigrab->source_hdc, DESKTOPVERTRES);
         info.hbmMask = NULL;
         info.hbmColor = NULL;
@@ -467,24 +538,25 @@ static void paint_mouse_pointer(AVFormatContext *s1, struct gdigrab *gdigrab)
             goto icon_error;
         }
 
-        pos.x = ci.ptScreenPos.x - clip_rect.left - info.xHotspot;
-        pos.y = ci.ptScreenPos.y - clip_rect.top - info.yHotspot;
-
         if (hwnd) {
             RECT rect;
 
             if (GetWindowRect(hwnd, &rect)) {
-                pos.x -= rect.left;
-                pos.y -= rect.top;
+                pos.x = ci.ptScreenPos.x - clip_rect.left - info.xHotspot - rect.left;
+                pos.y = ci.ptScreenPos.y - clip_rect.top - info.yHotspot - rect.top;
+
+                //that would keep the correct location of mouse with hidpi screens
+                pos.x = pos.x * desktophorzres / horzres;
+                pos.y = pos.y * desktopvertres / vertres;
             } else {
                 CURSOR_ERROR("Couldn't get window rectangle");
                 goto icon_error;
             }
+        } else {
+            //that would keep the correct location of mouse with hidpi screens
+            pos.x = ci.ptScreenPos.x * desktophorzres / horzres - clip_rect.left - info.xHotspot;
+            pos.y = ci.ptScreenPos.y * desktopvertres / vertres - clip_rect.top - info.yHotspot;
         }
-
-        //that would keep the correct location of mouse with hidpi screens
-        pos.x = pos.x * desktopvertres / vertres;
-        pos.y = pos.y * desktopvertres / vertres;
 
         av_log(s1, AV_LOG_DEBUG, "Cursor pos (%li,%li) -> (%li,%li)\n",
                 ci.ptScreenPos.x, ci.ptScreenPos.y, pos.x, pos.y);
@@ -532,13 +604,9 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
     /* Calculate the time of the next frame */
     time_frame += INT64_C(1000000);
 
-    /* Run Window message processing queue */
-    if (gdigrab->show_region)
-        gdigrab_region_wnd_update(s1, gdigrab);
-
     /* wait based on the frame rate */
     for (;;) {
-        curtime = av_gettime();
+        curtime = av_gettime_relative();
         delay = time_frame * av_q2d(time_base) - curtime;
         if (delay <= 0) {
             if (delay < INT64_C(-1000000) * av_q2d(time_base)) {
@@ -555,7 +623,7 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
 
     if (av_new_packet(pkt, file_size) < 0)
         return AVERROR(ENOMEM);
-    pkt->pts = curtime;
+    pkt->pts = av_gettime();
 
     /* Blit screen grab */
     if (!BitBlt(dest_hdc, 0, 0,
@@ -634,16 +702,17 @@ static const AVClass gdigrab_class = {
     .item_name  = av_default_item_name,
     .option     = options,
     .version    = LIBAVUTIL_VERSION_INT,
+    .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_INPUT,
 };
 
 /** gdi grabber device demuxer declaration */
-AVInputFormat ff_gdigrab_demuxer = {
-    .name           = "gdigrab",
-    .long_name      = NULL_IF_CONFIG_SMALL("GDI API Windows frame grabber"),
+const FFInputFormat ff_gdigrab_demuxer = {
+    .p.name         = "gdigrab",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("GDI API Windows frame grabber"),
+    .p.flags        = AVFMT_NOFILE,
+    .p.priv_class   = &gdigrab_class,
     .priv_data_size = sizeof(struct gdigrab),
     .read_header    = gdigrab_read_header,
     .read_packet    = gdigrab_read_packet,
     .read_close     = gdigrab_read_close,
-    .flags          = AVFMT_NOFILE,
-    .priv_class     = &gdigrab_class,
 };

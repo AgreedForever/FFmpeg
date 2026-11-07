@@ -25,41 +25,16 @@
  * Ported from MPlayer libmpcodecs/vf_boxblur.c.
  */
 
-#include "libavutil/avstring.h"
+#include "libavutil/avassert.h"
 #include "libavutil/common.h"
-#include "libavutil/eval.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "libavutil/pixdesc.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
+#include "boxblur.h"
 
-static const char *const var_names[] = {
-    "w",
-    "h",
-    "cw",
-    "ch",
-    "hsub",
-    "vsub",
-    NULL
-};
-
-enum var_name {
-    VAR_W,
-    VAR_H,
-    VAR_CW,
-    VAR_CH,
-    VAR_HSUB,
-    VAR_VSUB,
-    VARS_NB
-};
-
-typedef struct FilterParam {
-    int radius;
-    int power;
-    char *radius_expr;
-} FilterParam;
 
 typedef struct BoxBlurContext {
     const AVClass *class;
@@ -73,40 +48,6 @@ typedef struct BoxBlurContext {
     uint8_t *temp[2]; ///< temporary buffer used in blur_power()
 } BoxBlurContext;
 
-#define Y 0
-#define U 1
-#define V 2
-#define A 3
-
-static av_cold int init(AVFilterContext *ctx)
-{
-    BoxBlurContext *s = ctx->priv;
-
-    if (!s->luma_param.radius_expr) {
-        av_log(ctx, AV_LOG_ERROR, "Luma radius expression is not set.\n");
-        return AVERROR(EINVAL);
-    }
-
-    /* fill missing params */
-    if (!s->chroma_param.radius_expr) {
-        s->chroma_param.radius_expr = av_strdup(s->luma_param.radius_expr);
-        if (!s->chroma_param.radius_expr)
-            return AVERROR(ENOMEM);
-    }
-    if (s->chroma_param.power < 0)
-        s->chroma_param.power = s->luma_param.power;
-
-    if (!s->alpha_param.radius_expr) {
-        s->alpha_param.radius_expr = av_strdup(s->luma_param.radius_expr);
-        if (!s->alpha_param.radius_expr)
-            return AVERROR(ENOMEM);
-    }
-    if (s->alpha_param.power < 0)
-        s->alpha_param.power = s->luma_param.power;
-
-    return 0;
-}
-
 static av_cold void uninit(AVFilterContext *ctx)
 {
     BoxBlurContext *s = ctx->priv;
@@ -115,7 +56,9 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_freep(&s->temp[1]);
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     AVFilterFormats *formats = NULL;
     int fmt, ret;
@@ -123,13 +66,14 @@ static int query_formats(AVFilterContext *ctx)
     for (fmt = 0; av_pix_fmt_desc_get(fmt); fmt++) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
         if (!(desc->flags & (AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_PAL)) &&
+            desc->comp[0].depth <= 16 &&
             (desc->flags & AV_PIX_FMT_FLAG_PLANAR || desc->nb_components == 1) &&
             (!(desc->flags & AV_PIX_FMT_FLAG_BE) == !HAVE_BIGENDIAN || desc->comp[0].depth == 8) &&
             (ret = ff_add_format(&formats, fmt)) < 0)
             return ret;
     }
 
-    return ff_set_common_formats(ctx, formats);
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out, formats);
 }
 
 static int config_input(AVFilterLink *inlink)
@@ -138,9 +82,6 @@ static int config_input(AVFilterLink *inlink)
     AVFilterContext    *ctx = inlink->dst;
     BoxBlurContext *s = ctx->priv;
     int w = inlink->w, h = inlink->h;
-    int cw, ch;
-    double var_values[VARS_NB], res;
-    char *expr;
     int ret;
 
     if (!(s->temp[0] = av_malloc(2*FFMAX(w, h))) ||
@@ -150,48 +91,16 @@ static int config_input(AVFilterLink *inlink)
     s->hsub = desc->log2_chroma_w;
     s->vsub = desc->log2_chroma_h;
 
-    var_values[VAR_W]       = inlink->w;
-    var_values[VAR_H]       = inlink->h;
-    var_values[VAR_CW] = cw = w>>s->hsub;
-    var_values[VAR_CH] = ch = h>>s->vsub;
-    var_values[VAR_HSUB]    = 1<<s->hsub;
-    var_values[VAR_VSUB]    = 1<<s->vsub;
+    ret = ff_boxblur_eval_filter_params(inlink,
+                                        &s->luma_param,
+                                        &s->chroma_param,
+                                        &s->alpha_param);
 
-#define EVAL_RADIUS_EXPR(comp)                                          \
-    expr = s->comp##_param.radius_expr;                                 \
-    ret = av_expr_parse_and_eval(&res, expr, var_names, var_values,     \
-                                 NULL, NULL, NULL, NULL, NULL, 0, ctx); \
-    s->comp##_param.radius = res;                                       \
-    if (ret < 0) {                                                      \
-        av_log(NULL, AV_LOG_ERROR,                                      \
-               "Error when evaluating " #comp " radius expression '%s'\n", expr); \
-        return ret;                                                     \
+    if (ret != 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to evaluate "
+               "filter params: %d.\n", ret);
+        return ret;
     }
-    EVAL_RADIUS_EXPR(luma);
-    EVAL_RADIUS_EXPR(chroma);
-    EVAL_RADIUS_EXPR(alpha);
-
-    av_log(ctx, AV_LOG_VERBOSE,
-           "luma_radius:%d luma_power:%d "
-           "chroma_radius:%d chroma_power:%d "
-           "alpha_radius:%d alpha_power:%d "
-           "w:%d chroma_w:%d h:%d chroma_h:%d\n",
-           s->luma_param  .radius, s->luma_param  .power,
-           s->chroma_param.radius, s->chroma_param.power,
-           s->alpha_param .radius, s->alpha_param .power,
-           w, cw, h, ch);
-
-#define CHECK_RADIUS_VAL(w_, h_, comp)                                  \
-    if (s->comp##_param.radius < 0 ||                                   \
-        2*s->comp##_param.radius > FFMIN(w_, h_)) {                     \
-        av_log(ctx, AV_LOG_ERROR,                                       \
-               "Invalid " #comp " radius value %d, must be >= 0 and <= %d\n", \
-               s->comp##_param.radius, FFMIN(w_, h_)/2);                \
-        return AVERROR(EINVAL);                                         \
-    }
-    CHECK_RADIUS_VAL(w,  h,  luma);
-    CHECK_RADIUS_VAL(cw, ch, chroma);
-    CHECK_RADIUS_VAL(w,  h,  alpha);
 
     s->radius[Y] = s->luma_param.radius;
     s->radius[U] = s->radius[V] = s->chroma_param.radius;
@@ -256,7 +165,10 @@ static inline void blur(uint8_t *dst, int dst_step, const uint8_t *src, int src_
                         int len, int radius, int pixsize)
 {
     if (pixsize == 1) blur8 (dst, dst_step   , src, src_step   , len, radius);
-    else              blur16((uint16_t*)dst, dst_step>>1, (const uint16_t*)src, src_step>>1, len, radius);
+    else if (pixsize == 2)
+                      blur16((uint16_t*)dst, dst_step>>1, (const uint16_t*)src, src_step>>1, len, radius);
+    else
+        av_assert0(0);
 }
 
 static inline void blur_power(uint8_t *dst, int dst_step, const uint8_t *src, int src_step,
@@ -388,26 +300,16 @@ static const AVFilterPad avfilter_vf_boxblur_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad avfilter_vf_boxblur_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_boxblur = {
-    .name          = "boxblur",
-    .description   = NULL_IF_CONFIG_SMALL("Blur the input."),
+const FFFilter ff_vf_boxblur = {
+    .p.name        = "boxblur",
+    .p.description = NULL_IF_CONFIG_SMALL("Blur the input."),
+    .p.priv_class  = &boxblur_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(BoxBlurContext),
-    .priv_class    = &boxblur_class,
-    .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = avfilter_vf_boxblur_inputs,
-    .outputs       = avfilter_vf_boxblur_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(avfilter_vf_boxblur_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
 };

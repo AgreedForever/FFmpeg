@@ -16,12 +16,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/timer.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "libavutil/libm.h"
-#include "libavutil/timer.h"
+#include "libavutil/mathematics.h"
 #include "libavutil/eval.h"
 
 static const double const_values[] = {
@@ -125,9 +126,14 @@ int main(int argc, char **argv)
         "root(sin(ld(0))+6+sin(ld(0)/12)-log(ld(0)), 100)",
         "7000000B*random(0)",
         "squish(2)",
+        "-squish(2)",
         "gauss(0.1)",
+        "-gauss(0.1)",
         "hypot(4,3)",
         "gcd(30,55)*print(min(9,1))",
+        "-print(42)",
+        "lerp(0, 100, 0.5)",
+        "-lerp(0, 100, 0.5)",
         "bitor(42, 12)",
         "bitand(42, 12)",
         "bitand(NAN, 1)",

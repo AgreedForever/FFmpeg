@@ -20,13 +20,15 @@
  */
 
 #include "libavcodec/bytestream.h"
-#include "libavutil/avstring.h"
+#include "libavutil/attributes.h"
 #include "libavutil/intfloat.h"
-#include "avformat.h"
+#include "libavutil/mem.h"
 
 #include "rtmppkt.h"
 #include "flv.h"
 #include "url.h"
+
+#define MAX_DEPTH 16      ///< arbitrary limit to prevent unbounded recursion
 
 void ff_amf_write_bool(uint8_t **dst, int val)
 {
@@ -38,6 +40,12 @@ void ff_amf_write_number(uint8_t **dst, double val)
 {
     bytestream_put_byte(dst, AMF_DATA_TYPE_NUMBER);
     bytestream_put_be64(dst, av_double2int(val));
+}
+
+void ff_amf_write_array_start(uint8_t **dst, uint32_t length)
+{
+    bytestream_put_byte(dst, AMF_DATA_TYPE_ARRAY);
+    bytestream_put_be32(dst, length);
 }
 
 void ff_amf_write_string(uint8_t **dst, const char *str)
@@ -82,14 +90,6 @@ void ff_amf_write_object_end(uint8_t **dst)
      * AMF object should end with it and end marker
      */
     bytestream_put_be24(dst, AMF_DATA_TYPE_OBJECT_END);
-}
-
-int ff_amf_read_bool(GetByteContext *bc, int *val)
-{
-    if (bytestream2_get_byte(bc) != AMF_DATA_TYPE_BOOL)
-        return AVERROR_INVALIDDATA;
-    *val = bytestream2_get_byte(bc);
-    return 0;
 }
 
 int ff_amf_read_number(GetByteContext *bc, double *val)
@@ -314,7 +314,8 @@ int ff_rtmp_packet_write(URLContext *h, RTMPPacket *pkt,
                          int chunk_size, RTMPPacket **prev_pkt_ptr,
                          int *nb_prev_pkt)
 {
-    uint8_t pkt_hdr[16], *p = pkt_hdr;
+    uint8_t pkt_hdr[18], *p = pkt_hdr;
+    int basic_hdr_size;
     int mode = RTMP_PS_TWELVEBYTES;
     int off = 0;
     int written = 0;
@@ -363,6 +364,7 @@ int ff_rtmp_packet_write(URLContext *h, RTMPPacket *pkt,
         bytestream_put_byte(&p, 1               | (mode << 6));
         bytestream_put_le16(&p, pkt->channel_id - 64);
     }
+    basic_hdr_size = p - pkt_hdr;
     if (mode != RTMP_PS_ONEBYTE) {
         bytestream_put_be24(&p, pkt->ts_field);
         if (mode != RTMP_PS_FOURBYTES) {
@@ -382,19 +384,25 @@ int ff_rtmp_packet_write(URLContext *h, RTMPPacket *pkt,
     prev_pkt[pkt->channel_id].ts_field   = pkt->ts_field;
     prev_pkt[pkt->channel_id].extra      = pkt->extra;
 
+    // FIXME:
+    // Writing packets is currently not optimized to minimize system calls.
+    // Since system calls flush on exit which we cannot change in a system-independant way.
+    // We should fix this behavior and by writing packets in a single or in as few as possible system calls.
+    // Protocols like TCP and RTMP should benefit from this when enabling TCP_NODELAY.
+
     if ((ret = ffurl_write(h, pkt_hdr, p - pkt_hdr)) < 0)
         return ret;
     written = p - pkt_hdr + pkt->size;
+    pkt_hdr[0] |= RTMP_PS_ONEBYTE << 6;
     while (off < pkt->size) {
         int towrite = FFMIN(chunk_size, pkt->size - off);
         if ((ret = ffurl_write(h, pkt->data + off, towrite)) < 0)
             return ret;
         off += towrite;
         if (off < pkt->size) {
-            uint8_t marker = 0xC0 | pkt->channel_id;
-            if ((ret = ffurl_write(h, &marker, 1)) < 0)
+            if ((ret = ffurl_write(h, pkt_hdr, basic_hdr_size)) < 0)
                 return ret;
-            written++;
+            written += basic_hdr_size;
             if (pkt->ts_field == 0xFFFFFF) {
                 uint8_t ts_header[4];
                 AV_WB32(ts_header, timestamp);
@@ -433,105 +441,155 @@ void ff_rtmp_packet_destroy(RTMPPacket *pkt)
     pkt->size = 0;
 }
 
-int ff_amf_tag_size(const uint8_t *data, const uint8_t *data_end)
+static int amf_tag_skip(GetByteContext *gb, int depth)
 {
-    const uint8_t *base = data;
     AMFDataType type;
     unsigned nb   = -1;
-    int parse_key = 1;
 
-    if (data >= data_end)
+    if (bytestream2_get_bytes_left(gb) < 1)
         return -1;
-    switch ((type = *data++)) {
-    case AMF_DATA_TYPE_NUMBER:      return 9;
-    case AMF_DATA_TYPE_BOOL:        return 2;
-    case AMF_DATA_TYPE_STRING:      return 3 + AV_RB16(data);
-    case AMF_DATA_TYPE_LONG_STRING: return 5 + AV_RB32(data);
-    case AMF_DATA_TYPE_NULL:        return 1;
-    case AMF_DATA_TYPE_DATE:        return 11;
+
+    if (depth > MAX_DEPTH) {
+        av_log(NULL, AV_LOG_ERROR, "amf_tag_skip: exceeded max depth\n");
+        return AVERROR_PATCHWELCOME;
+    }
+
+    type = bytestream2_get_byte(gb);
+    switch (type) {
+    case AMF_DATA_TYPE_NUMBER:
+        bytestream2_get_be64(gb);
+        return 0;
+    case AMF_DATA_TYPE_BOOL:
+        bytestream2_get_byte(gb);
+        return 0;
+    case AMF_DATA_TYPE_STRING:
+        bytestream2_skip(gb, bytestream2_get_be16(gb));
+        return 0;
+    case AMF_DATA_TYPE_LONG_STRING:
+        bytestream2_skip(gb, bytestream2_get_be32(gb));
+        return 0;
+    case AMF_DATA_TYPE_NULL:
+        return 0;
+    case AMF_DATA_TYPE_DATE:
+        bytestream2_skip(gb, 10);
+        return 0;
     case AMF_DATA_TYPE_ARRAY:
-        parse_key = 0;
     case AMF_DATA_TYPE_MIXEDARRAY:
-        nb = bytestream_get_be32(&data);
+        nb = bytestream2_get_be32(gb);
+        av_fallthrough;
     case AMF_DATA_TYPE_OBJECT:
-        while (nb-- > 0 || type != AMF_DATA_TYPE_ARRAY) {
+        while (type != AMF_DATA_TYPE_ARRAY || nb-- > 0) {
             int t;
-            if (parse_key) {
-                int size = bytestream_get_be16(&data);
+            if (type != AMF_DATA_TYPE_ARRAY) {
+                int size = bytestream2_get_be16(gb);
                 if (!size) {
-                    data++;
+                    bytestream2_get_byte(gb);
                     break;
                 }
-                if (size < 0 || size >= data_end - data)
+                if (size < 0 || size >= bytestream2_get_bytes_left(gb))
                     return -1;
-                data += size;
+                bytestream2_skip(gb, size);
             }
-            t = ff_amf_tag_size(data, data_end);
-            if (t < 0 || t >= data_end - data)
+            t = amf_tag_skip(gb, depth + 1);
+            if (t < 0 || bytestream2_get_bytes_left(gb) <= 0)
                 return -1;
-            data += t;
         }
-        return data - base;
-    case AMF_DATA_TYPE_OBJECT_END:  return 1;
+        return 0;
+    case AMF_DATA_TYPE_OBJECT_END:  return 0;
     default:                        return -1;
     }
 }
 
-int ff_amf_get_field_value(const uint8_t *data, const uint8_t *data_end,
+int ff_amf_tag_size(const uint8_t *data, const uint8_t *data_end)
+{
+    GetByteContext gb;
+    int ret;
+
+    if (data >= data_end)
+        return -1;
+
+    bytestream2_init(&gb, data, data_end - data);
+
+    ret = amf_tag_skip(&gb, 0);
+    if (ret < 0 || bytestream2_get_bytes_left(&gb) <= 0)
+        return -1;
+    av_assert0(bytestream2_tell(&gb) >= 0 && bytestream2_tell(&gb) <= data_end - data);
+    return bytestream2_tell(&gb);
+}
+
+static int amf_get_field_value2(GetByteContext *gb,
                            const uint8_t *name, uint8_t *dst, int dst_size)
 {
     int namelen = strlen(name);
     int len;
 
-    while (*data != AMF_DATA_TYPE_OBJECT && data < data_end) {
-        len = ff_amf_tag_size(data, data_end);
-        if (len < 0)
-            len = data_end - data;
-        data += len;
+    while (bytestream2_peek_byte(gb) != AMF_DATA_TYPE_OBJECT && bytestream2_get_bytes_left(gb) > 0) {
+        int ret = amf_tag_skip(gb, 0);
+        if (ret < 0)
+            return -1;
     }
-    if (data_end - data < 3)
+    if (bytestream2_get_bytes_left(gb) < 3)
         return -1;
-    data++;
+    bytestream2_get_byte(gb);
+
     for (;;) {
-        int size = bytestream_get_be16(&data);
+        int size = bytestream2_get_be16(gb);
         if (!size)
             break;
-        if (size < 0 || size >= data_end - data)
+        if (size < 0 || size >= bytestream2_get_bytes_left(gb))
             return -1;
-        data += size;
-        if (size == namelen && !memcmp(data-size, name, namelen)) {
-            switch (*data++) {
+        bytestream2_skip(gb, size);
+        if (size == namelen && !memcmp(gb->buffer-size, name, namelen)) {
+            switch (bytestream2_get_byte(gb)) {
             case AMF_DATA_TYPE_NUMBER:
-                snprintf(dst, dst_size, "%g", av_int2double(AV_RB64(data)));
+                snprintf(dst, dst_size, "%g", av_int2double(bytestream2_get_be64(gb)));
                 break;
             case AMF_DATA_TYPE_BOOL:
-                snprintf(dst, dst_size, "%s", *data ? "true" : "false");
+                snprintf(dst, dst_size, "%s", bytestream2_get_byte(gb) ? "true" : "false");
                 break;
             case AMF_DATA_TYPE_STRING:
-                len = bytestream_get_be16(&data);
-                av_strlcpy(dst, data, FFMIN(len+1, dst_size));
+                len = bytestream2_get_be16(gb);
+                if (dst_size < 1)
+                    return -1;
+                if (dst_size < len + 1)
+                    len = dst_size - 1;
+                len = bytestream2_get_buffer(gb, dst, len);
+                dst[len] = 0;
                 break;
             default:
                 return -1;
             }
             return 0;
         }
-        len = ff_amf_tag_size(data, data_end);
-        if (len < 0 || len >= data_end - data)
+        len = amf_tag_skip(gb, 0);
+        if (len < 0 || bytestream2_get_bytes_left(gb) <= 0)
             return -1;
-        data += len;
     }
     return -1;
 }
 
+int ff_amf_get_field_value(const uint8_t *data, const uint8_t *data_end,
+                           const uint8_t *name, uint8_t *dst, int dst_size)
+{
+    GetByteContext gb;
+
+    if (data >= data_end)
+        return -1;
+
+    bytestream2_init(&gb, data, data_end - data);
+
+    return amf_get_field_value2(&gb, name, dst, dst_size);
+}
+
+#ifdef DEBUG
 static const char* rtmp_packet_type(int type)
 {
     switch (type) {
     case RTMP_PT_CHUNK_SIZE:     return "chunk size";
     case RTMP_PT_BYTES_READ:     return "bytes read";
-    case RTMP_PT_PING:           return "ping";
-    case RTMP_PT_SERVER_BW:      return "server bandwidth";
-    case RTMP_PT_CLIENT_BW:      return "client bandwidth";
+    case RTMP_PT_USER_CONTROL:   return "user control";
+    case RTMP_PT_WINDOW_ACK_SIZE: return "window acknowledgement size";
+    case RTMP_PT_SET_PEER_BW:    return "set peer bandwidth";
     case RTMP_PT_AUDIO:          return "audio packet";
     case RTMP_PT_VIDEO:          return "video packet";
     case RTMP_PT_FLEX_STREAM:    return "Flex shared stream";
@@ -546,12 +604,17 @@ static const char* rtmp_packet_type(int type)
 }
 
 static void amf_tag_contents(void *ctx, const uint8_t *data,
-                             const uint8_t *data_end)
+                             const uint8_t *data_end, int depth)
 {
     unsigned int size, nb = -1;
     char buf[1024];
     AMFDataType type;
     int parse_key = 1;
+
+    if (depth > MAX_DEPTH) {
+        av_log(NULL, AV_LOG_ERROR, "amf_tag_contents: exceeded max depth\n");
+        return;
+    }
 
     if (data >= data_end)
         return;
@@ -579,8 +642,10 @@ static void amf_tag_contents(void *ctx, const uint8_t *data,
         return;
     case AMF_DATA_TYPE_ARRAY:
         parse_key = 0;
+        av_fallthrough;
     case AMF_DATA_TYPE_MIXEDARRAY:
         nb = bytestream_get_be32(&data);
+        av_fallthrough;
     case AMF_DATA_TYPE_OBJECT:
         av_log(ctx, AV_LOG_DEBUG, " {\n");
         while (nb-- > 0 || type != AMF_DATA_TYPE_ARRAY) {
@@ -600,7 +665,7 @@ static void amf_tag_contents(void *ctx, const uint8_t *data,
                 data += size;
                 av_log(ctx, AV_LOG_DEBUG, "  %s: ", buf);
             }
-            amf_tag_contents(ctx, data, data_end);
+            amf_tag_contents(ctx, data, data_end, depth + 1);
             t = ff_amf_tag_size(data, data_end);
             if (t < 0 || t >= data_end - data)
                 return;
@@ -623,16 +688,16 @@ void ff_rtmp_packet_dump(void *ctx, RTMPPacket *p)
         uint8_t *src = p->data, *src_end = p->data + p->size;
         while (src < src_end) {
             int sz;
-            amf_tag_contents(ctx, src, src_end);
+            amf_tag_contents(ctx, src, src_end, 0);
             sz = ff_amf_tag_size(src, src_end);
             if (sz < 0)
                 break;
             src += sz;
         }
-    } else if (p->type == RTMP_PT_SERVER_BW){
-        av_log(ctx, AV_LOG_DEBUG, "Server BW = %d\n", AV_RB32(p->data));
-    } else if (p->type == RTMP_PT_CLIENT_BW){
-        av_log(ctx, AV_LOG_DEBUG, "Client BW = %d\n", AV_RB32(p->data));
+    } else if (p->type == RTMP_PT_WINDOW_ACK_SIZE) {
+        av_log(ctx, AV_LOG_DEBUG, "Window acknowledgement size = %d\n", AV_RB32(p->data));
+    } else if (p->type == RTMP_PT_SET_PEER_BW) {
+        av_log(ctx, AV_LOG_DEBUG, "Set Peer BW = %d\n", AV_RB32(p->data));
     } else if (p->type != RTMP_PT_AUDIO && p->type != RTMP_PT_VIDEO && p->type != RTMP_PT_METADATA) {
         int i;
         for (i = 0; i < p->size; i++)
@@ -640,6 +705,7 @@ void ff_rtmp_packet_dump(void *ctx, RTMPPacket *p)
         av_log(ctx, AV_LOG_DEBUG, "\n");
     }
 }
+#endif
 
 int ff_amf_match_string(const uint8_t *data, int size, const char *str)
 {

@@ -57,7 +57,7 @@ SECTION .text
 %endmacro
 
 ;-----------------------------------------------------------------------------
-; void ff_put/avg_h264_chroma_mc8(pixel *dst, pixel *src, ptrdiff_t stride,
+; void ff_put/avg_h264_chroma_mc8(pixel *dst, const pixel *src, ptrdiff_t stride,
 ;                                 int h, int mx, int my)
 ;-----------------------------------------------------------------------------
 %macro CHROMA_MC8 1
@@ -67,7 +67,7 @@ cglobal %1_h264_chroma_mc8_10, 6,7,8
     jne .at_least_one_non_zero
     ; mx == 0 AND my == 0 - no filter needed
     MV0_PIXELS_MC8
-    REP_RET
+    RET
 
 .at_least_one_non_zero:
     mov          r6d, 2
@@ -102,7 +102,7 @@ cglobal %1_h264_chroma_mc8_10, 6,7,8
     add           r1, r2
     dec           r3d
     jne .next1drow
-    REP_RET
+    RET
 
 .xy_interpolation: ; general case, bilinear
     movd          m4, r4m         ; x
@@ -144,7 +144,7 @@ cglobal %1_h264_chroma_mc8_10, 6,7,8
     add           r0, r2
     dec          r3d
     jne .next2drow
-    REP_RET
+    RET
 %endmacro
 
 ;-----------------------------------------------------------------------------
@@ -194,15 +194,15 @@ cglobal %1_h264_chroma_mc4_10, 6,6,7
     MC4_OP m6, m0
     sub   r3d, 2
     jnz .next2rows
-    REP_RET
+    RET
 %endmacro
 
 ;-----------------------------------------------------------------------------
-; void ff_put/avg_h264_chroma_mc2(pixel *dst, pixel *src, ptrdiff_t stride,
+; void ff_put/avg_h264_chroma_mc2(pixel *dst, const pixel *src, ptrdiff_t stride,
 ;                                 int h, int mx, int my)
 ;-----------------------------------------------------------------------------
 %macro CHROMA_MC2 1
-cglobal %1_h264_chroma_mc2_10, 6,7
+cglobal %1_h264_chroma_mc2_10, 6,7,6
     mov          r6d, r4d
     shl          r4d, 16
     sub          r4d, r6d
@@ -212,29 +212,31 @@ cglobal %1_h264_chroma_mc2_10, 6,7
     sub          r4d, r5d         ; x*(8-y)<<16 | (8-x)*(8-y)
 
     movd          m5, r4d
-    movd          m6, r5d
+    movd          m4, r5d
     punpckldq     m5, m5          ; mm5 = {A,B,A,B}
-    punpckldq     m6, m6          ; mm6 = {C,D,C,D}
-    pxor          m7, m7
-    pshufw        m2, [r1], 0x94    ; mm0 = src[0,1,1,2]
+    punpckldq     m4, m4          ; mm4 = {C,D,C,D}
+    pxor          m3, m3
+    movq          m2, [r1]
+    pshuflw       m2, m2, 0x94    ; mm0 = src[0,1,1,2]
 
 .nextrow:
     add           r1, r2
     movq          m1, m2
     pmaddwd       m1, m5          ; mm1 = A * src[0,1] + B * src[1,2]
-    pshufw        m0, [r1], 0x94    ; mm0 = src[0,1,1,2]
+    movq          m0, [r1]
+    pshuflw       m0, m0, 0x94    ; mm0 = src[0,1,1,2]
     movq          m2, m0
-    pmaddwd       m0, m6
+    pmaddwd       m0, m4
     paddw         m1, [pw_32]
     paddw         m1, m0          ; mm1 += C * src[0,1] + D * src[1,2]
     psrlw         m1, 6
-    packssdw      m1, m7
-    CHROMAMC_AVG  m1, m3, [r0]
+    packssdw      m1, m3
+    CHROMAMC_AVG  m1, m0, [r0]
     movd        [r0], m1
     add           r0, r2
     dec          r3d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
 %macro NOTHING 2-3
@@ -247,23 +249,21 @@ cglobal %1_h264_chroma_mc2_10, 6,7
 %endmacro
 
 %define CHROMAMC_AVG  NOTHING
-INIT_XMM sse2
-CHROMA_MC8 put
 %if HAVE_AVX_EXTERNAL
 INIT_XMM avx
 CHROMA_MC8 put
 %endif
-INIT_MMX mmxext
+INIT_XMM sse2
+CHROMA_MC8 put
 CHROMA_MC4 put
 CHROMA_MC2 put
 
 %define CHROMAMC_AVG  AVG
-INIT_XMM sse2
-CHROMA_MC8 avg
 %if HAVE_AVX_EXTERNAL
 INIT_XMM avx
 CHROMA_MC8 avg
 %endif
-INIT_MMX mmxext
+INIT_XMM sse2
+CHROMA_MC8 avg
 CHROMA_MC4 avg
 CHROMA_MC2 avg

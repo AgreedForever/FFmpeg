@@ -17,9 +17,11 @@
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
-#include "avcodec.h"
+
+#include "config.h"
 #include "lossless_videodsp.h"
 #include "libavcodec/mathops.h"
+#include "libavutil/attributes.h"
 
 // 0x7f7f7f7f or 0x7f7f7f7f7f7f7f7f or whatever, depending on the cpu's native arithmetic size
 #define pb_7f (~0UL / 255 * 0x7f)
@@ -98,17 +100,33 @@ static int add_left_pred_int16_c(uint16_t *dst, const uint16_t *src, unsigned ma
     return acc;
 }
 
+static void add_gradient_pred_c(uint8_t *src, const ptrdiff_t stride, const ptrdiff_t width){
+    int A, B, C, i;
 
-void ff_llviddsp_init(LLVidDSPContext *c)
+    for (i = 0; i < width; i++) {
+        A = src[i - stride];
+        B = src[i - (stride + 1)];
+        C = src[i - 1];
+        src[i] = (A - B + C + src[i]) & 0xFF;
+    }
+}
+
+av_cold void ff_llviddsp_init(LLVidDSPContext *c)
 {
     c->add_bytes                  = add_bytes_c;
     c->add_median_pred            = add_median_pred_c;
     c->add_left_pred              = add_left_pred_c;
 
     c->add_left_pred_int16        = add_left_pred_int16_c;
+    c->add_gradient_pred          = add_gradient_pred_c;
 
-    if (ARCH_PPC)
-        ff_llviddsp_init_ppc(c);
-    if (ARCH_X86)
-        ff_llviddsp_init_x86(c);
+#if ARCH_AARCH64
+    ff_llviddsp_init_aarch64(c);
+#elif ARCH_PPC
+    ff_llviddsp_init_ppc(c);
+#elif ARCH_RISCV
+    ff_llviddsp_init_riscv(c);
+#elif ARCH_X86 && HAVE_X86ASM
+    ff_llviddsp_init_x86(c);
+#endif
 }

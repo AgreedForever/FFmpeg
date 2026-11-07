@@ -37,6 +37,7 @@
 #include "libavutil/base64.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
 
 #include "rtpdec.h"
@@ -166,7 +167,7 @@ static int sdp_parse_fmtp_config_h264(AVFormatContext *s,
             parse_profile_level_id(s, h264_data, value);
     } else if (!strcmp(attr, "sprop-parameter-sets")) {
         int ret;
-        if (value[strlen(value) - 1] == ',') {
+        if (*value == 0 || value[strlen(value) - 1] == ',') {
             av_log(s, AV_LOG_WARNING, "Missing PPS in sprop-parameter-sets, ignoring\n");
             return 0;
         }
@@ -196,6 +197,9 @@ void ff_h264_parse_framesize(AVCodecParameters *par, const char *p)
     while (*p && *p != '-' && (dst - buf1) < sizeof(buf1) - 1)
         *dst++ = *p++;
     *dst = '\0';
+
+    if (*p != '-')
+        return;
 
     // a='framesize:96 320-240'
     // set our parameters
@@ -408,7 +412,7 @@ static int parse_h264_sdp_line(AVFormatContext *s, int st_index,
     return 0;
 }
 
-RTPDynamicProtocolHandler ff_h264_dynamic_handler = {
+const RTPDynamicProtocolHandler ff_h264_dynamic_handler = {
     .enc_name         = "H264",
     .codec_type       = AVMEDIA_TYPE_VIDEO,
     .codec_id         = AV_CODEC_ID_H264,

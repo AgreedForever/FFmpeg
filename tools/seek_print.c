@@ -24,13 +24,14 @@
 #endif
 
 #include "libavformat/avformat.h"
+#include "libavutil/attributes.h"
 #include "libavutil/timestamp.h"
 
 #if !HAVE_GETOPT
 #include "compat/getopt.c"
 #endif
 
-static void usage(int ret)
+av_noreturn static void usage(int ret)
 {
     fprintf(ret ? stderr : stdout,
             "Usage: seek_print file [command ...]\n"
@@ -65,7 +66,6 @@ int main(int argc, char **argv)
     argv++;
     argc--;
 
-    av_register_all();
     if ((ret = avformat_open_input(&avf, filename, NULL, NULL)) < 0) {
         fprintf(stderr, "%s: %s\n", filename, av_err2str(ret));
         return 1;

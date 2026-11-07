@@ -61,18 +61,17 @@ typedef struct IVIHuffDesc {
  *  macroblock/block huffman table descriptor
  */
 typedef struct IVIHuffTab {
-    int32_t     tab_sel;    /// index of one of the predefined tables
-                            /// or "7" for custom one
-    VLC         *tab;       /// pointer to the table associated with tab_sel
+    int32_t     tab_sel;    ///< index of one of the predefined tables, or "7" for custom one
+    VLC         *tab;       ///< pointer to the table associated with tab_sel
 
-    /// the following are used only when tab_sel == 7
-    IVIHuffDesc cust_desc;  /// custom Huffman codebook descriptor
-    VLC         cust_tab;   /// vlc table for custom codebook
+    // the following are used only when tab_sel == 7
+    IVIHuffDesc cust_desc;  ///< custom Huffman codebook descriptor
+    VLC         cust_tab;   ///< vlc table for custom codebook
 } IVIHuffTab;
 
 enum {
-    IVI_MB_HUFF   = 0,      /// Huffman table is used for coding macroblocks
-    IVI_BLK_HUFF  = 1       /// Huffman table is used for coding blocks
+    IVI_MB_HUFF   = 0,      ///< Huffman table is used for coding macroblocks
+    IVI_BLK_HUFF  = 1       ///< Huffman table is used for coding blocks
 };
 
 
@@ -322,8 +321,8 @@ int  ff_ivi_dec_huff_desc(GetBitContext *gb, int desc_coded, int which_tab,
  *  @param[in]      is_indeo4  flag signalling if it is Indeo 4 or not
  *  @return             result code: 0 - OK
  */
-int  ff_ivi_init_planes(IVIPlaneDesc *planes, const IVIPicConfig *cfg,
-                        int is_indeo4);
+int  ff_ivi_init_planes(AVCodecContext *avctx, IVIPlaneDesc *planes,
+                        const IVIPicConfig *cfg, int is_indeo4);
 
 /**
  *  Initialize tile and macroblock descriptors.
@@ -335,8 +334,8 @@ int  ff_ivi_init_planes(IVIPlaneDesc *planes, const IVIPicConfig *cfg,
  */
 int  ff_ivi_init_tiles(IVIPlaneDesc *planes, int tile_width, int tile_height);
 
-int ff_ivi_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                        AVPacket *avpkt);
+int ff_ivi_decode_frame(AVCodecContext *avctx, AVFrame *data,
+                        int *got_frame, AVPacket *avpkt);
 int ff_ivi_decode_close(AVCodecContext *avctx);
 
 #endif /* AVCODEC_IVI_H */

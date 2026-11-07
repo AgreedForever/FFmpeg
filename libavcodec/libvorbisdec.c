@@ -18,11 +18,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <string.h>
 #include <vorbis/vorbisenc.h>
 
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct OggVorbisDecContext {
     vorbis_info vi;                     /**< vorbis_info used during init   */
@@ -34,7 +36,8 @@ typedef struct OggVorbisDecContext {
 
 static int oggvorbis_decode_close(AVCodecContext *avccontext);
 
-static int oggvorbis_decode_init(AVCodecContext *avccontext) {
+static av_cold int oggvorbis_decode_init(AVCodecContext *avccontext)
+{
     OggVorbisDecContext *context = avccontext->priv_data ;
     uint8_t *p= avccontext->extradata;
     int i, hsizes[3], ret;
@@ -49,29 +52,40 @@ static int oggvorbis_decode_init(AVCodecContext *avccontext) {
     vorbis_comment_init(&context->vc) ;
 
     if(p[0] == 0 && p[1] == 30) {
+        int sizesum = 0;
         for(i = 0; i < 3; i++){
             hsizes[i] = bytestream_get_be16((const uint8_t **)&p);
+            sizesum += 2 + hsizes[i];
+            if (sizesum > avccontext->extradata_size) {
+                av_log(avccontext, AV_LOG_ERROR, "vorbis extradata too small\n");
+                ret = AVERROR_INVALIDDATA;
+                goto error;
+            }
+
             headers[i] = p;
             p += hsizes[i];
         }
     } else if(*p == 2) {
         unsigned int offset = 1;
+        unsigned int sizesum = 1;
         p++;
         for(i=0; i<2; i++) {
             hsizes[i] = 0;
-            while((*p == 0xFF) && (offset < avccontext->extradata_size)) {
+            while((*p == 0xFF) && (sizesum < avccontext->extradata_size)) {
                 hsizes[i] += 0xFF;
                 offset++;
+                sizesum += 1 + 0xFF;
                 p++;
             }
-            if(offset >= avccontext->extradata_size - 1) {
+            hsizes[i] += *p;
+            offset++;
+            sizesum += 1 + *p;
+            if(sizesum > avccontext->extradata_size) {
                 av_log(avccontext, AV_LOG_ERROR,
                        "vorbis header sizes damaged\n");
                 ret = AVERROR_INVALIDDATA;
                 goto error;
             }
-            hsizes[i] += *p;
-            offset++;
             p++;
         }
         hsizes[2] = avccontext->extradata_size - hsizes[0]-hsizes[1]-offset;
@@ -101,9 +115,17 @@ static int oggvorbis_decode_init(AVCodecContext *avccontext) {
         }
     }
 
-    avccontext->channels = context->vi.channels;
+    if (context->vi.rate <= 0 || context->vi.rate > INT_MAX) {
+        av_log(avccontext, AV_LOG_ERROR, "vorbis rate is invalid\n");
+        ret = AVERROR_INVALIDDATA;
+        goto error;
+    }
+
+    av_channel_layout_uninit(&avccontext->ch_layout);
+    avccontext->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    avccontext->ch_layout.nb_channels = context->vi.channels;
     avccontext->sample_rate = context->vi.rate;
-    avccontext->sample_fmt = AV_SAMPLE_FMT_S16;
+    avccontext->sample_fmt = AV_SAMPLE_FMT_FLTP;
     avccontext->time_base= (AVRational){1, avccontext->sample_rate};
 
     vorbis_synthesis_init(&context->vd, &context->vi);
@@ -117,34 +139,14 @@ static int oggvorbis_decode_init(AVCodecContext *avccontext) {
 }
 
 
-static inline int conv(int samples, float **pcm, char *buf, int channels) {
-    int i, j;
-    ogg_int16_t *ptr, *data = (ogg_int16_t*)buf ;
-    float *mono ;
-
-    for(i = 0 ; i < channels ; i++){
-        ptr = &data[i];
-        mono = pcm[i] ;
-
-        for(j = 0 ; j < samples ; j++) {
-            *ptr = av_clip_int16(mono[j] * 32767.f);
-            ptr += channels;
-        }
-    }
-
-    return 0 ;
-}
-
-static int oggvorbis_decode_frame(AVCodecContext *avccontext, void *data,
-                        int *got_frame_ptr, AVPacket *avpkt)
+static int oggvorbis_decode_frame(AVCodecContext *avccontext, AVFrame *frame,
+                                  int *got_frame_ptr, AVPacket *avpkt)
 {
     OggVorbisDecContext *context = avccontext->priv_data ;
-    AVFrame *frame = data;
     float **pcm ;
     ogg_packet *op= &context->op;
-    int samples, total_samples, total_bytes;
+    int samples, total_samples;
     int ret;
-    int16_t *output;
 
     if(!avpkt->size){
     //FIXME flush
@@ -154,8 +156,6 @@ static int oggvorbis_decode_frame(AVCodecContext *avccontext, void *data,
     frame->nb_samples = 8192*4;
     if ((ret = ff_get_buffer(avccontext, frame, 0)) < 0)
         return ret;
-    output = (int16_t *)frame->data[0];
-
 
     op->packet = avpkt->data;
     op->bytes  = avpkt->size;
@@ -170,11 +170,10 @@ static int oggvorbis_decode_frame(AVCodecContext *avccontext, void *data,
         vorbis_synthesis_blockin(&context->vd, &context->vb) ;
 
     total_samples = 0 ;
-    total_bytes = 0 ;
 
     while((samples = vorbis_synthesis_pcmout(&context->vd, &pcm)) > 0) {
-        conv(samples, pcm, (char*)output + total_bytes, context->vi.channels) ;
-        total_bytes += samples * 2 * context->vi.channels ;
+        for (int ch = 0; ch < context->vi.channels; ch++)
+            memcpy((float *)frame->extended_data[ch] + total_samples, pcm[ch], samples * sizeof(float));
         total_samples += samples ;
         vorbis_synthesis_read(&context->vd, samples) ;
     }
@@ -185,7 +184,8 @@ static int oggvorbis_decode_frame(AVCodecContext *avccontext, void *data,
 }
 
 
-static int oggvorbis_decode_close(AVCodecContext *avccontext) {
+static av_cold int oggvorbis_decode_close(AVCodecContext *avccontext)
+{
     OggVorbisDecContext *context = avccontext->priv_data ;
 
     vorbis_block_clear(&context->vb);
@@ -197,14 +197,15 @@ static int oggvorbis_decode_close(AVCodecContext *avccontext) {
 }
 
 
-AVCodec ff_libvorbis_decoder = {
-    .name           = "libvorbis",
-    .long_name      = NULL_IF_CONFIG_SMALL("libvorbis"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_VORBIS,
+const FFCodec ff_libvorbis_decoder = {
+    .p.name         = "libvorbis",
+    CODEC_LONG_NAME("libvorbis"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_VORBIS,
+    .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_CHANNEL_CONF,
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
     .priv_data_size = sizeof(OggVorbisDecContext),
     .init           = oggvorbis_decode_init,
-    .decode         = oggvorbis_decode_frame,
+    FF_CODEC_DECODE_CB(oggvorbis_decode_frame),
     .close          = oggvorbis_decode_close,
-    .capabilities   = AV_CODEC_CAP_DELAY,
 };

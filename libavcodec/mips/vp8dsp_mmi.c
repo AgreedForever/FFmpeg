@@ -23,7 +23,173 @@
 
 #include "vp8dsp_mips.h"
 #include "constants.h"
+#include "libavutil/attributes.h"
+#include "libavutil/intfloat.h"
 #include "libavutil/mips/mmiutils.h"
+#include "libavutil/mem_internal.h"
+
+#define DECLARE_DOUBLE_1            double db_1
+#define DECLARE_DOUBLE_2            double db_2
+#define DECLARE_UINT32_T            uint32_t  it_1
+#define RESTRICT_ASM_DOUBLE_1       [db_1]"=&f"(db_1)
+#define RESTRICT_ASM_DOUBLE_2       [db_2]"=&f"(db_2)
+#define RESTRICT_ASM_UINT32_T       [it_1]"=&r"(it_1)
+
+#define MMI_PCMPGTUB(dst, src1, src2)                                       \
+        "pcmpeqb    %[db_1],    "#src1",        "#src2"             \n\t"   \
+        "pmaxub     %[db_2],    "#src1",        "#src2"             \n\t"   \
+        "pcmpeqb    %[db_2],    %[db_2],        "#src1"             \n\t"   \
+        "pxor       "#dst",     %[db_2],        %[db_1]             \n\t"
+
+#define MMI_BTOH(dst_l, dst_r, src)                                         \
+        "pxor       %[db_1],    %[db_1],        %[db_1]             \n\t"   \
+        "pcmpgtb    %[db_2],    %[db_1],        "#src"              \n\t"   \
+        "punpcklbh  "#dst_r",   "#src",         %[db_2]             \n\t"   \
+        "punpckhbh  "#dst_l",   "#src",         %[db_2]             \n\t"
+
+#define MMI_VP8_LOOP_FILTER                                                 \
+        /* Calculation of hev */                                            \
+        "dmtc1      %[thresh],  %[ftmp3]                            \n\t"   \
+        "punpcklbh  %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        "punpcklhw  %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        "punpcklwd  %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        "pasubub    %[ftmp0],   %[p1],          %[p0]               \n\t"   \
+        "pasubub    %[ftmp1],   %[q1],          %[q0]               \n\t"   \
+        "pmaxub     %[ftmp0],   %[ftmp0],       %[ftmp1]            \n\t"   \
+        MMI_PCMPGTUB(%[hev], %[ftmp0], %[ftmp3])                            \
+        /* Calculation of mask */                                           \
+        "pasubub    %[ftmp1],   %[p0],          %[q0]               \n\t"   \
+        "paddusb    %[ftmp1],   %[ftmp1],       %[ftmp1]            \n\t"   \
+        "pasubub    %[ftmp2],   %[p1],          %[q1]               \n\t"   \
+        "li         %[tmp0],    0x09                                \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp3]                            \n\t"   \
+        PSRLB_MMI(%[ftmp2],  %[ftmp3],  %[ftmp4],  %[ftmp5],  %[ftmp2])     \
+        "paddusb    %[ftmp1],   %[ftmp1],       %[ftmp2]            \n\t"   \
+        "dmtc1      %[e],       %[ftmp3]                            \n\t"   \
+        "punpcklbh  %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        "punpcklhw  %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        "punpcklwd  %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        MMI_PCMPGTUB(%[mask], %[ftmp1], %[ftmp3])                           \
+        "pmaxub     %[mask],    %[mask],        %[ftmp0]            \n\t"   \
+        "pasubub    %[ftmp1],   %[p3],          %[p2]               \n\t"   \
+        "pasubub    %[ftmp2],   %[p2],          %[p1]               \n\t"   \
+        "pmaxub     %[ftmp1],   %[ftmp1],       %[ftmp2]            \n\t"   \
+        "pmaxub     %[mask],    %[mask],        %[ftmp1]            \n\t"   \
+        "pasubub    %[ftmp1],   %[q3],          %[q2]               \n\t"   \
+        "pasubub    %[ftmp2],   %[q2],          %[q1]               \n\t"   \
+        "pmaxub     %[ftmp1],   %[ftmp1],       %[ftmp2]            \n\t"   \
+        "pmaxub     %[mask],    %[mask],        %[ftmp1]            \n\t"   \
+        "dmtc1      %[i],       %[ftmp3]                            \n\t"   \
+        "punpcklbh  %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        "punpcklhw  %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        "punpcklwd  %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        MMI_PCMPGTUB(%[mask], %[mask], %[ftmp3])                            \
+        "pcmpeqw    %[ftmp3],   %[ftmp3],       %[ftmp3]            \n\t"   \
+        "pxor       %[mask],    %[mask],        %[ftmp3]            \n\t"   \
+        /* VP8_MBFILTER */                                                  \
+        "li         %[tmp0],    0x80808080                          \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp7]                            \n\t"   \
+        "punpcklwd  %[ftmp7],   %[ftmp7],       %[ftmp7]            \n\t"   \
+        "pxor       %[p2],      %[p2],          %[ftmp7]            \n\t"   \
+        "pxor       %[p1],      %[p1],          %[ftmp7]            \n\t"   \
+        "pxor       %[p0],      %[p0],          %[ftmp7]            \n\t"   \
+        "pxor       %[q0],      %[q0],          %[ftmp7]            \n\t"   \
+        "pxor       %[q1],      %[q1],          %[ftmp7]            \n\t"   \
+        "pxor       %[q2],      %[q2],          %[ftmp7]            \n\t"   \
+        "psubsb     %[ftmp4],   %[p1],          %[q1]               \n\t"   \
+        "psubb      %[ftmp5],   %[q0],          %[p0]               \n\t"   \
+        MMI_BTOH(%[ftmp1],  %[ftmp0],  %[ftmp5])                            \
+        MMI_BTOH(%[ftmp3],  %[ftmp2],  %[ftmp4])                            \
+        /* Right part */                                                    \
+        "paddh      %[ftmp5],   %[ftmp0],       %[ftmp0]            \n\t"   \
+        "paddh      %[ftmp0],   %[ftmp0],       %[ftmp5]            \n\t"   \
+        "paddh      %[ftmp0],   %[ftmp2],       %[ftmp0]            \n\t"   \
+        /* Left part */                                                     \
+        "paddh      %[ftmp5],   %[ftmp1],       %[ftmp1]            \n\t"   \
+        "paddh      %[ftmp1],   %[ftmp1],       %[ftmp5]            \n\t"   \
+        "paddh      %[ftmp1],   %[ftmp3],       %[ftmp1]            \n\t"   \
+        /* Combine left and right part */                                   \
+        "packsshb   %[ftmp1],   %[ftmp0],       %[ftmp1]            \n\t"   \
+        "pand       %[ftmp1],   %[ftmp1],       %[mask]             \n\t"   \
+        "pand       %[ftmp2],   %[ftmp1],       %[hev]              \n\t"   \
+        "li         %[tmp0],    0x04040404                          \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp0]                            \n\t"   \
+        "punpcklwd  %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"   \
+        "paddsb     %[ftmp3],   %[ftmp2],       %[ftmp0]            \n\t"   \
+        "li         %[tmp0],    0x0B                                \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp4]                            \n\t"   \
+        PSRAB_MMI(%[ftmp3],  %[ftmp4],  %[ftmp5],  %[ftmp6],  %[ftmp3])     \
+        "li         %[tmp0],    0x03030303                          \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp0]                            \n\t"   \
+        "punpcklwd  %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"   \
+        "paddsb     %[ftmp4],   %[ftmp2],       %[ftmp0]            \n\t"   \
+        "li         %[tmp0],    0x0B                                \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp2]                            \n\t"   \
+        PSRAB_MMI(%[ftmp4],  %[ftmp2],  %[ftmp5],  %[ftmp6],  %[ftmp4])     \
+        "psubsb     %[q0],      %[q0],          %[ftmp3]            \n\t"   \
+        "paddsb     %[p0],      %[p0],          %[ftmp4]            \n\t"   \
+        /* filt_val &= ~hev */                                              \
+        "pcmpeqw    %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"   \
+        "pxor       %[hev],     %[hev],         %[ftmp0]            \n\t"   \
+        "pand       %[ftmp1],   %[ftmp1],       %[hev]              \n\t"   \
+        MMI_BTOH(%[ftmp5],  %[ftmp6],  %[ftmp1])                            \
+        "li         %[tmp0],    0x07                                \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp2]                            \n\t"   \
+        "li         %[tmp0],    0x001b001b                          \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp1]                            \n\t"   \
+        "punpcklwd  %[ftmp1],   %[ftmp1],       %[ftmp1]            \n\t"   \
+        "li         %[tmp0],    0x003f003f                          \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp0]                            \n\t"   \
+        "punpcklwd  %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"   \
+        /* Right part */                                                    \
+        "pmullh     %[ftmp3],   %[ftmp6],       %[ftmp1]            \n\t"   \
+        "paddh      %[ftmp3],   %[ftmp3],       %[ftmp0]            \n\t"   \
+        "psrah      %[ftmp3],   %[ftmp3],       %[ftmp2]            \n\t"   \
+        /* Left part */                                                     \
+        "pmullh     %[ftmp4],   %[ftmp5],       %[ftmp1]            \n\t"   \
+        "paddh      %[ftmp4],   %[ftmp4],       %[ftmp0]            \n\t"   \
+        "psrah      %[ftmp4],   %[ftmp4],       %[ftmp2]            \n\t"   \
+        /* Combine left and right part */                                   \
+        "packsshb   %[ftmp4],   %[ftmp3],       %[ftmp4]            \n\t"   \
+        "psubsb     %[q0],      %[q0],          %[ftmp4]            \n\t"   \
+        "pxor       %[q0],      %[q0],          %[ftmp7]            \n\t"   \
+        "paddsb     %[p0],      %[p0],          %[ftmp4]            \n\t"   \
+        "pxor       %[p0],      %[p0],          %[ftmp7]            \n\t"   \
+        "li         %[tmp0],    0x00120012                          \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp1]                            \n\t"   \
+        "punpcklwd  %[ftmp1],   %[ftmp1],       %[ftmp1]            \n\t"   \
+        /* Right part */                                                    \
+        "pmullh     %[ftmp3],   %[ftmp6],       %[ftmp1]            \n\t"   \
+        "paddh      %[ftmp3],   %[ftmp3],       %[ftmp0]            \n\t"   \
+        "psrah      %[ftmp3],   %[ftmp3],       %[ftmp2]            \n\t"   \
+        /* Left part */                                                     \
+        "pmullh     %[ftmp4],   %[ftmp5],       %[ftmp1]            \n\t"   \
+        "paddh      %[ftmp4],   %[ftmp4],       %[ftmp0]            \n\t"   \
+        "psrah      %[ftmp4],   %[ftmp4],       %[ftmp2]            \n\t"   \
+        /* Combine left and right part */                                   \
+        "packsshb   %[ftmp4],   %[ftmp3],       %[ftmp4]            \n\t"   \
+        "psubsb     %[q1],      %[q1],          %[ftmp4]            \n\t"   \
+        "pxor       %[q1],      %[q1],          %[ftmp7]            \n\t"   \
+        "paddsb     %[p1],      %[p1],          %[ftmp4]            \n\t"   \
+        "pxor       %[p1],      %[p1],          %[ftmp7]            \n\t"   \
+        "li         %[tmp0],    0x03                                \n\t"   \
+        "dmtc1      %[tmp0],    %[ftmp1]                            \n\t"   \
+        /* Right part */                                                    \
+        "psllh      %[ftmp3],   %[ftmp6],       %[ftmp1]            \n\t"   \
+        "paddh      %[ftmp3],   %[ftmp3],       %[ftmp6]            \n\t"   \
+        "paddh      %[ftmp3],   %[ftmp3],       %[ftmp0]            \n\t"   \
+        "psrah      %[ftmp3],   %[ftmp3],       %[ftmp2]            \n\t"   \
+        /* Left part */                                                     \
+        "psllh      %[ftmp4],   %[ftmp5],       %[ftmp1]            \n\t"   \
+        "paddh      %[ftmp4],   %[ftmp4],       %[ftmp5]            \n\t"   \
+        "paddh      %[ftmp4],   %[ftmp4],       %[ftmp0]            \n\t"   \
+        "psrah      %[ftmp4],   %[ftmp4],       %[ftmp2]            \n\t"   \
+        /* Combine left and right part */                                   \
+        "packsshb   %[ftmp4],   %[ftmp3],       %[ftmp4]            \n\t"   \
+        "psubsb     %[q2],      %[q2],          %[ftmp4]            \n\t"   \
+        "pxor       %[q2],      %[q2],          %[ftmp7]            \n\t"   \
+        "paddsb     %[p2],      %[p2],          %[ftmp4]            \n\t"   \
+        "pxor       %[p2],      %[p2],          %[ftmp7]            \n\t"
 
 #define PUT_VP8_EPEL4_H6_MMI(src, dst)                                      \
         MMI_ULWC1(%[ftmp1], src, 0x00)                                      \
@@ -503,10 +669,10 @@ static const uint8_t subpel_filters[7][6] = {
 static av_always_inline void vp8_filter_common_is4tap(uint8_t *p,
         ptrdiff_t stride)
 {
-    int av_unused p1 = p[-2 * stride];
-    int av_unused p0 = p[-1 * stride];
-    int av_unused q0 = p[ 0 * stride];
-    int av_unused q1 = p[ 1 * stride];
+    av_unused int p1 = p[-2 * stride];
+    av_unused int p0 = p[-1 * stride];
+    av_unused int q0 = p[ 0 * stride];
+    av_unused int q1 = p[ 1 * stride];
     int a, f1, f2;
     const uint8_t *cm = ff_crop_tab + MAX_NEG_CROP;
 
@@ -528,10 +694,10 @@ static av_always_inline void vp8_filter_common_is4tap(uint8_t *p,
 static av_always_inline void vp8_filter_common_isnot4tap(uint8_t *p,
         ptrdiff_t stride)
 {
-    int av_unused p1 = p[-2 * stride];
-    int av_unused p0 = p[-1 * stride];
-    int av_unused q0 = p[ 0 * stride];
-    int av_unused q1 = p[ 1 * stride];
+    av_unused int p1 = p[-2 * stride];
+    av_unused int p0 = p[-1 * stride];
+    av_unused int q0 = p[ 0 * stride];
+    av_unused int q1 = p[ 1 * stride];
     int a, f1, f2;
     const uint8_t *cm = ff_crop_tab + MAX_NEG_CROP;
 
@@ -555,20 +721,20 @@ static av_always_inline void vp8_filter_common_isnot4tap(uint8_t *p,
 static av_always_inline int vp8_simple_limit(uint8_t *p, ptrdiff_t stride,
         int flim)
 {
-    int av_unused p1 = p[-2 * stride];
-    int av_unused p0 = p[-1 * stride];
-    int av_unused q0 = p[ 0 * stride];
-    int av_unused q1 = p[ 1 * stride];
+    av_unused int p1 = p[-2 * stride];
+    av_unused int p0 = p[-1 * stride];
+    av_unused int q0 = p[ 0 * stride];
+    av_unused int q1 = p[ 1 * stride];
 
     return 2 * FFABS(p0 - q0) + (FFABS(p1 - q1) >> 1) <= flim;
 }
 
 static av_always_inline int hev(uint8_t *p, ptrdiff_t stride, int thresh)
 {
-    int av_unused p1 = p[-2 * stride];
-    int av_unused p0 = p[-1 * stride];
-    int av_unused q0 = p[ 0 * stride];
-    int av_unused q1 = p[ 1 * stride];
+    av_unused int p1 = p[-2 * stride];
+    av_unused int p0 = p[-1 * stride];
+    av_unused int q0 = p[ 0 * stride];
+    av_unused int q1 = p[ 1 * stride];
 
     return FFABS(p1 - p0) > thresh || FFABS(q1 - q0) > thresh;
 }
@@ -578,12 +744,12 @@ static av_always_inline void filter_mbedge(uint8_t *p, ptrdiff_t stride)
     int a0, a1, a2, w;
     const uint8_t *cm = ff_crop_tab + MAX_NEG_CROP;
 
-    int av_unused p2 = p[-3 * stride];
-    int av_unused p1 = p[-2 * stride];
-    int av_unused p0 = p[-1 * stride];
-    int av_unused q0 = p[ 0 * stride];
-    int av_unused q1 = p[ 1 * stride];
-    int av_unused q2 = p[ 2 * stride];
+    av_unused int p2 = p[-3 * stride];
+    av_unused int p1 = p[-2 * stride];
+    av_unused int p0 = p[-1 * stride];
+    av_unused int q0 = p[ 0 * stride];
+    av_unused int q1 = p[ 1 * stride];
+    av_unused int q2 = p[ 2 * stride];
 
     w = clip_int8(p1 - q1);
     w = clip_int8(w + 3 * (q0 - p0));
@@ -603,14 +769,14 @@ static av_always_inline void filter_mbedge(uint8_t *p, ptrdiff_t stride)
 static av_always_inline int vp8_normal_limit(uint8_t *p, ptrdiff_t stride,
         int E, int I)
 {
-    int av_unused p3 = p[-4 * stride];
-    int av_unused p2 = p[-3 * stride];
-    int av_unused p1 = p[-2 * stride];
-    int av_unused p0 = p[-1 * stride];
-    int av_unused q0 = p[ 0 * stride];
-    int av_unused q1 = p[ 1 * stride];
-    int av_unused q2 = p[ 2 * stride];
-    int av_unused q3 = p[ 3 * stride];
+    av_unused int p3 = p[-4 * stride];
+    av_unused int p2 = p[-3 * stride];
+    av_unused int p1 = p[-2 * stride];
+    av_unused int p0 = p[-1 * stride];
+    av_unused int q0 = p[ 0 * stride];
+    av_unused int q1 = p[ 1 * stride];
+    av_unused int q2 = p[ 2 * stride];
+    av_unused int q3 = p[ 3 * stride];
 
     return vp8_simple_limit(p, stride, E) &&
            FFABS(p3 - p2) <= I && FFABS(p2 - p1) <= I &&
@@ -621,15 +787,60 @@ static av_always_inline int vp8_normal_limit(uint8_t *p, ptrdiff_t stride,
 static av_always_inline void vp8_v_loop_filter8_mmi(uint8_t *dst,
         ptrdiff_t stride, int flim_E, int flim_I, int hev_thresh)
 {
-    int i;
+    double ftmp[18];
+    uint32_t tmp[1];
+    DECLARE_DOUBLE_1;
+    DECLARE_DOUBLE_2;
+    DECLARE_UINT32_T;
+    DECLARE_VAR_ALL64;
 
-    for (i = 0; i < 8; i++)
-        if (vp8_normal_limit(dst + i * 1, stride, flim_E, flim_I)) {
-            if (hev(dst + i * 1, stride, hev_thresh))
-                vp8_filter_common_is4tap(dst + i * 1, stride);
-            else
-                filter_mbedge(dst + i * 1, stride);
-        }
+    __asm__ volatile(
+        /* Get data from dst */
+        MMI_ULDC1(%[q0], %[dst], 0x0)
+        PTR_SUBU    "%[tmp0],   %[dst],         %[stride]         \n\t"
+        MMI_ULDC1(%[p0], %[tmp0], 0x0)
+        PTR_SUBU    "%[tmp0],   %[tmp0],        %[stride]         \n\t"
+        MMI_ULDC1(%[p1], %[tmp0], 0x0)
+        PTR_SUBU    "%[tmp0],   %[tmp0],        %[stride]         \n\t"
+        MMI_ULDC1(%[p2], %[tmp0], 0x0)
+        PTR_SUBU    "%[tmp0],   %[tmp0],        %[stride]         \n\t"
+        MMI_ULDC1(%[p3], %[tmp0], 0x0)
+        PTR_ADDU    "%[tmp0],   %[dst],         %[stride]         \n\t"
+        MMI_ULDC1(%[q1], %[tmp0], 0x0)
+        PTR_ADDU    "%[tmp0],   %[tmp0],        %[stride]         \n\t"
+        MMI_ULDC1(%[q2], %[tmp0], 0x0)
+        PTR_ADDU    "%[tmp0],   %[tmp0],        %[stride]         \n\t"
+        MMI_ULDC1(%[q3], %[tmp0], 0x0)
+        MMI_VP8_LOOP_FILTER
+        /* Move to dst */
+        MMI_USDC1(%[q0], %[dst], 0x0)
+        PTR_SUBU    "%[tmp0],   %[dst],         %[stride]         \n\t"
+        MMI_USDC1(%[p0], %[tmp0], 0x0)
+        PTR_SUBU    "%[tmp0],   %[tmp0],        %[stride]         \n\t"
+        MMI_USDC1(%[p1], %[tmp0], 0x0)
+        PTR_SUBU    "%[tmp0],   %[tmp0],        %[stride]         \n\t"
+        MMI_USDC1(%[p2], %[tmp0], 0x0)
+        PTR_ADDU    "%[tmp0],   %[dst],         %[stride]         \n\t"
+        MMI_USDC1(%[q1], %[tmp0], 0x0)
+        PTR_ADDU    "%[tmp0],   %[tmp0],        %[stride]         \n\t"
+        MMI_USDC1(%[q2], %[tmp0], 0x0)
+        : RESTRICT_ASM_ALL64
+          [p3]"=&f"(ftmp[0]),       [p2]"=&f"(ftmp[1]),
+          [p1]"=&f"(ftmp[2]),       [p0]"=&f"(ftmp[3]),
+          [q0]"=&f"(ftmp[4]),       [q1]"=&f"(ftmp[5]),
+          [q2]"=&f"(ftmp[6]),       [q3]"=&f"(ftmp[7]),
+          [ftmp0]"=&f"(ftmp[8]),    [ftmp1]"=&f"(ftmp[9]),
+          [ftmp2]"=&f"(ftmp[10]),   [ftmp3]"=&f"(ftmp[11]),
+          [hev]"=&f"(ftmp[12]),     [mask]"=&f"(ftmp[13]),
+          [ftmp4]"=&f"(ftmp[14]),   [ftmp5]"=&f"(ftmp[15]),
+          [ftmp6]"=&f"(ftmp[16]),   [ftmp7]"=&f"(ftmp[17]),
+          [dst]"+&r"(dst),          [tmp0]"=&r"(tmp[0]),
+          RESTRICT_ASM_DOUBLE_1,    RESTRICT_ASM_DOUBLE_2,
+          RESTRICT_ASM_UINT32_T
+        : [e]"r"((mips_reg)flim_E), [thresh]"r"((mips_reg)hev_thresh),
+          [i]"r"((mips_reg)flim_I), [stride]"r"((mips_reg)stride)
+        : "memory"
+    );
 }
 
 static av_always_inline void vp8_v_loop_filter8_inner_mmi(uint8_t *dst,
@@ -650,15 +861,72 @@ static av_always_inline void vp8_v_loop_filter8_inner_mmi(uint8_t *dst,
 static av_always_inline void vp8_h_loop_filter8_mmi(uint8_t *dst,
         ptrdiff_t stride, int flim_E, int flim_I, int hev_thresh)
 {
-    int i;
+    double ftmp[18];
+    uint32_t tmp[1];
+    DECLARE_DOUBLE_1;
+    DECLARE_DOUBLE_2;
+    DECLARE_UINT32_T;
+    DECLARE_VAR_ALL64;
 
-    for (i = 0; i < 8; i++)
-        if (vp8_normal_limit(dst + i * stride, 1, flim_E, flim_I)) {
-            if (hev(dst + i * stride, 1, hev_thresh))
-                vp8_filter_common_is4tap(dst + i * stride, 1);
-            else
-                filter_mbedge(dst + i * stride, 1);
-        }
+    __asm__ volatile(
+        /* Get data from dst */
+        MMI_ULDC1(%[p3], %[dst], -0x04)
+        PTR_ADDU    "%[tmp0],     %[dst],           %[stride]     \n\t"
+        MMI_ULDC1(%[p2], %[tmp0], -0x04)
+        PTR_ADDU    "%[tmp0],     %[tmp0],          %[stride]     \n\t"
+        MMI_ULDC1(%[p1], %[tmp0], -0x04)
+        PTR_ADDU    "%[tmp0],     %[tmp0],          %[stride]     \n\t"
+        MMI_ULDC1(%[p0], %[tmp0], -0x04)
+        PTR_ADDU    "%[tmp0],     %[tmp0],          %[stride]     \n\t"
+        MMI_ULDC1(%[q0], %[tmp0], -0x04)
+        PTR_ADDU    "%[tmp0],     %[tmp0],          %[stride]     \n\t"
+        MMI_ULDC1(%[q1], %[tmp0], -0x04)
+        PTR_ADDU    "%[tmp0],     %[tmp0],          %[stride]     \n\t"
+        MMI_ULDC1(%[q2], %[tmp0], -0x04)
+        PTR_ADDU    "%[tmp0],     %[tmp0],          %[stride]     \n\t"
+        MMI_ULDC1(%[q3], %[tmp0], -0x04)
+        /* Matrix transpose */
+        TRANSPOSE_8B(%[p3], %[p2], %[p1], %[p0],
+                     %[q0], %[q1], %[q2], %[q3],
+                     %[ftmp1], %[ftmp2], %[ftmp3], %[ftmp4])
+        MMI_VP8_LOOP_FILTER
+        /* Matrix transpose */
+        TRANSPOSE_8B(%[p3], %[p2], %[p1], %[p0],
+                     %[q0], %[q1], %[q2], %[q3],
+                     %[ftmp1], %[ftmp2], %[ftmp3], %[ftmp4])
+        /* Move to dst */
+        MMI_USDC1(%[p3], %[dst], -0x04)
+        PTR_ADDU    "%[dst],      %[dst],           %[stride]     \n\t"
+        MMI_USDC1(%[p2], %[dst], -0x04)
+        PTR_ADDU    "%[dst],      %[dst],           %[stride]     \n\t"
+        MMI_USDC1(%[p1], %[dst], -0x04)
+        PTR_ADDU    "%[dst],      %[dst],           %[stride]     \n\t"
+        MMI_USDC1(%[p0], %[dst], -0x04)
+        PTR_ADDU    "%[dst],      %[dst],           %[stride]     \n\t"
+        MMI_USDC1(%[q0], %[dst], -0x04)
+        PTR_ADDU    "%[dst],      %[dst],           %[stride]     \n\t"
+        MMI_USDC1(%[q1], %[dst], -0x04)
+        PTR_ADDU    "%[dst],      %[dst],           %[stride]     \n\t"
+        MMI_USDC1(%[q2], %[dst], -0x04)
+        PTR_ADDU    "%[dst],      %[dst],           %[stride]     \n\t"
+        MMI_USDC1(%[q3], %[dst], -0x04)
+        : RESTRICT_ASM_ALL64
+          [p3]"=&f"(ftmp[0]),       [p2]"=&f"(ftmp[1]),
+          [p1]"=&f"(ftmp[2]),       [p0]"=&f"(ftmp[3]),
+          [q0]"=&f"(ftmp[4]),       [q1]"=&f"(ftmp[5]),
+          [q2]"=&f"(ftmp[6]),       [q3]"=&f"(ftmp[7]),
+          [ftmp0]"=&f"(ftmp[8]),    [ftmp1]"=&f"(ftmp[9]),
+          [ftmp2]"=&f"(ftmp[10]),   [ftmp3]"=&f"(ftmp[11]),
+          [hev]"=&f"(ftmp[12]),     [mask]"=&f"(ftmp[13]),
+          [ftmp4]"=&f"(ftmp[14]),   [ftmp5]"=&f"(ftmp[15]),
+          [ftmp6]"=&f"(ftmp[16]),   [ftmp7]"=&f"(ftmp[17]),
+          [dst]"+&r"(dst),          [tmp0]"=&r"(tmp[0]),
+          RESTRICT_ASM_DOUBLE_1,    RESTRICT_ASM_DOUBLE_2,
+          RESTRICT_ASM_UINT32_T
+        : [e]"r"((mips_reg)flim_E), [thresh]"r"((mips_reg)hev_thresh),
+          [i]"r"((mips_reg)flim_I), [stride]"r"((mips_reg)stride)
+        : "memory"
+    );
 }
 
 static av_always_inline void vp8_h_loop_filter8_inner_mmi(uint8_t *dst,
@@ -730,7 +998,7 @@ void ff_vp8_luma_dc_wht_mmi(int16_t block[4][4][16], int16_t dc[16])
     block[3][3][0] = (dc[12] - dc[15] + 3 - dc[13] + dc[14]) >> 3;
 
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         MMI_SDC1(%[ftmp0], %[dc], 0x00)
         MMI_SDC1(%[ftmp0], %[dc], 0x08)
         MMI_SDC1(%[ftmp0], %[dc], 0x10)
@@ -837,15 +1105,17 @@ void ff_vp8_luma_dc_wht_dc_mmi(int16_t block[4][4][16], int16_t dc[16])
 void ff_vp8_idct_add_mmi(uint8_t *dst, int16_t block[16], ptrdiff_t stride)
 {
 #if 1
-    DECLARE_ALIGNED(8, const uint64_t, ff_ph_4e7b) = {0x4e7b4e7b4e7b4e7bULL};
-    DECLARE_ALIGNED(8, const uint64_t, ff_ph_22a3) = {0x22a322a322a322a3ULL};
     double ftmp[12];
     uint32_t tmp[1];
+    union av_intfloat64 ff_ph_4e7b_u;
+    union av_intfloat64 ff_ph_22a3_u;
     DECLARE_VAR_LOW32;
     DECLARE_VAR_ALL64;
+    ff_ph_4e7b_u.i = 0x4e7b4e7b4e7b4e7bULL;
+    ff_ph_22a3_u.i = 0x22a322a322a322a3ULL;
 
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         MMI_LDC1(%[ftmp1], %[block], 0x00)
         MMI_LDC1(%[ftmp2], %[block], 0x08)
         MMI_LDC1(%[ftmp3], %[block], 0x10)
@@ -890,8 +1160,7 @@ void ff_vp8_idct_add_mmi(uint8_t *dst, int16_t block[16], ptrdiff_t stride)
         MMI_SDC1(%[ftmp0], %[block], 0x18)
 
         TRANSPOSE_4H(%[ftmp1], %[ftmp2], %[ftmp3], %[ftmp4],
-                     %[ftmp5], %[ftmp6], %[ftmp7], %[ftmp8],
-                     %[ftmp9], %[tmp0],  %[ftmp0], %[ftmp10])
+                     %[ftmp5], %[ftmp6], %[ftmp7], %[ftmp8])
 
         // t[0 4  8 12]
         "paddh      %[ftmp5],   %[ftmp1],       %[ftmp3]            \n\t"
@@ -926,8 +1195,7 @@ void ff_vp8_idct_add_mmi(uint8_t *dst, int16_t block[16], ptrdiff_t stride)
         "psrah      %[ftmp4],   %[ftmp4],       %[ftmp11]           \n\t"
 
         TRANSPOSE_4H(%[ftmp1], %[ftmp2], %[ftmp3], %[ftmp4],
-                     %[ftmp5], %[ftmp6], %[ftmp7], %[ftmp8],
-                     %[ftmp9], %[tmp0],  %[ftmp0], %[ftmp10])
+                     %[ftmp5], %[ftmp6], %[ftmp7], %[ftmp8])
 
         MMI_LWC1(%[ftmp5], %[dst0], 0x00)
         MMI_LWC1(%[ftmp6], %[dst1], 0x00)
@@ -964,8 +1232,8 @@ void ff_vp8_idct_add_mmi(uint8_t *dst, int16_t block[16], ptrdiff_t stride)
           [tmp0]"=&r"(tmp[0])
         : [dst0]"r"(dst),                   [dst1]"r"(dst+stride),
           [dst2]"r"(dst+2*stride),          [dst3]"r"(dst+3*stride),
-          [block]"r"(block),                [ff_pw_4]"f"(ff_pw_4),
-          [ff_ph_4e7b]"f"(ff_ph_4e7b),      [ff_ph_22a3]"f"(ff_ph_22a3)
+          [block]"r"(block),                [ff_pw_4]"f"(ff_pw_4.f),
+          [ff_ph_4e7b]"f"(ff_ph_4e7b_u.f),  [ff_ph_22a3]"f"(ff_ph_22a3_u.f)
         : "memory"
     );
 #else
@@ -1013,7 +1281,7 @@ void ff_vp8_idct_dc_add_mmi(uint8_t *dst, int16_t block[16], ptrdiff_t stride)
     block[0] = 0;
 
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "mtc1       %[dc],      %[ftmp5]                            \n\t"
         MMI_LWC1(%[ftmp1], %[dst0], 0x00)
         MMI_LWC1(%[ftmp2], %[dst1], 0x00)
@@ -1083,29 +1351,16 @@ void ff_vp8_idct_dc_add4uv_mmi(uint8_t *dst, int16_t block[4][16],
 void ff_vp8_v_loop_filter16_mmi(uint8_t *dst, ptrdiff_t stride, int flim_E,
         int flim_I, int hev_thresh)
 {
-    int i;
-
-    for (i = 0; i < 16; i++)
-        if (vp8_normal_limit(dst + i * 1, stride, flim_E, flim_I)) {
-            if (hev(dst + i * 1, stride, hev_thresh))
-                vp8_filter_common_is4tap(dst + i * 1, stride);
-            else
-                filter_mbedge(dst + i * 1, stride);
-        }
+    vp8_v_loop_filter8_mmi(dst, stride, flim_E, flim_I, hev_thresh);
+    vp8_v_loop_filter8_mmi(dst + 8, stride, flim_E, flim_I, hev_thresh);
 }
 
 void ff_vp8_h_loop_filter16_mmi(uint8_t *dst, ptrdiff_t stride, int flim_E,
         int flim_I, int hev_thresh)
 {
-    int i;
-
-    for (i = 0; i < 16; i++)
-        if (vp8_normal_limit(dst + i * stride, 1, flim_E, flim_I)) {
-            if (hev(dst + i * stride, 1, hev_thresh))
-                vp8_filter_common_is4tap(dst + i * stride, 1);
-            else
-                filter_mbedge(dst + i * stride, 1);
-        }
+    vp8_h_loop_filter8_mmi(dst, stride, flim_E, flim_I, hev_thresh);
+    vp8_h_loop_filter8_mmi(dst + 8 * stride, stride, flim_E, flim_I,
+                           hev_thresh);
 }
 
 void ff_vp8_v_loop_filter8uv_mmi(uint8_t *dstU, uint8_t *dstV, ptrdiff_t stride,
@@ -1185,7 +1440,7 @@ void ff_vp8_h_loop_filter_simple_mmi(uint8_t *dst, ptrdiff_t stride, int flim)
             vp8_filter_common_is4tap(dst + i * stride, 1);
 }
 
-void ff_put_vp8_pixels16_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_pixels16_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int x, int y)
 {
 #if 1
@@ -1232,7 +1487,7 @@ void ff_put_vp8_pixels16_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_pixels8_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_pixels8_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int x, int y)
 {
 #if 1
@@ -1272,7 +1527,7 @@ void ff_put_vp8_pixels8_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_pixels4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_pixels4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int x, int y)
 {
 #if 1
@@ -1312,15 +1567,23 @@ void ff_put_vp8_pixels4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel16_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel16_h4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
     const uint64_t *filter = fourtap_subpel_filters[mx - 1];
     double ftmp[9];
     uint32_t tmp[1];
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
     mips_reg src1, dst1;
     DECLARE_VAR_ALL64;
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
 
     /*
     dst[0] = cm[(filter[2] * src[0] - filter[1] * src[-1] + filter[3] * src[1] - filter[4] * src[2] + 64) >> 7];
@@ -1342,7 +1605,7 @@ void ff_put_vp8_epel16_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[15] = cm[(filter[2] * src[15] - filter[1] * src[14] + filter[3] * src[16] - filter[4] * src[17] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1368,11 +1631,11 @@ void ff_put_vp8_epel16_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [dst1]"=&r"(dst1),                [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter1]"f"(filter[1]),          [filter2]"f"(filter[2]),
-          [filter3]"f"(filter[3]),          [filter4]"f"(filter[4])
+          [filter1]"f"(filter1.f),          [filter2]"f"(filter2.f),
+          [filter3]"f"(filter3.f),          [filter4]"f"(filter4.f)
         : "memory"
     );
 #else
@@ -1389,14 +1652,23 @@ void ff_put_vp8_epel16_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel8_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel8_h4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
     const uint64_t *filter = fourtap_subpel_filters[mx - 1];
     double ftmp[9];
     uint32_t tmp[1];
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
     DECLARE_VAR_ALL64;
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
+
 
     /*
     dst[0] = cm[(filter[2] * src[0] - filter[1] * src[-1] + filter[3] * src[1] - filter[4] * src[2] + 64) >> 7];
@@ -1409,7 +1681,7 @@ void ff_put_vp8_epel8_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[7] = cm[(filter[2] * src[7] - filter[1] * src[ 6] + filter[3] * src[8] - filter[4] * src[9] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1429,11 +1701,11 @@ void ff_put_vp8_epel8_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           RESTRICT_ASM_ALL64
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter1]"f"(filter[1]),          [filter2]"f"(filter[2]),
-          [filter3]"f"(filter[3]),          [filter4]"f"(filter[4])
+          [filter1]"f"(filter1.f),          [filter2]"f"(filter2.f),
+          [filter3]"f"(filter3.f),          [filter4]"f"(filter4.f)
         : "memory"
     );
 #else
@@ -1450,14 +1722,22 @@ void ff_put_vp8_epel8_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel4_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel4_h4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
     const uint64_t *filter = fourtap_subpel_filters[mx - 1];
     double ftmp[6];
     uint32_t tmp[1];
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
     DECLARE_VAR_LOW32;
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
 
     /*
     dst[0] = cm[(filter[2] * src[0] - filter[1] * src[-1] + filter[3] * src[1] - filter[4] * src[2] + 64) >> 7];
@@ -1466,7 +1746,7 @@ void ff_put_vp8_epel4_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[3] = cm[(filter[2] * src[3] - filter[1] * src[ 2] + filter[3] * src[4] - filter[4] * src[5] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1484,11 +1764,11 @@ void ff_put_vp8_epel4_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           RESTRICT_ASM_LOW32
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter1]"f"(filter[1]),          [filter2]"f"(filter[2]),
-          [filter3]"f"(filter[3]),          [filter4]"f"(filter[4])
+          [filter1]"f"(filter1.f),          [filter2]"f"(filter2.f),
+          [filter3]"f"(filter3.f),          [filter4]"f"(filter4.f)
         : "memory"
     );
 #else
@@ -1505,7 +1785,7 @@ void ff_put_vp8_epel4_h4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel16_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel16_h6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -1513,7 +1793,19 @@ void ff_put_vp8_epel16_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     double ftmp[9];
     uint32_t tmp[1];
     mips_reg src1, dst1;
+    union av_intfloat64 filter0;
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
+    union av_intfloat64 filter5;
     DECLARE_VAR_ALL64;
+    filter0.i = filter[0];
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
+    filter5.i = filter[5];
 
     /*
     dst[ 0] = cm[(filter[2]*src[ 0] - filter[1]*src[-1] + filter[0]*src[-2] + filter[3]*src[ 1] - filter[4]*src[ 2] + filter[5]*src[ 3] + 64) >> 7];
@@ -1535,7 +1827,7 @@ void ff_put_vp8_epel16_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[15] = cm[(filter[2]*src[15] - filter[1]*src[14] + filter[0]*src[13] + filter[3]*src[16] - filter[4]*src[17] + filter[5]*src[18] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1561,12 +1853,12 @@ void ff_put_vp8_epel16_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [dst1]"=&r"(dst1),                [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter0]"f"(filter[0]),          [filter1]"f"(filter[1]),
-          [filter2]"f"(filter[2]),          [filter3]"f"(filter[3]),
-          [filter4]"f"(filter[4]),          [filter5]"f"(filter[5])
+          [filter0]"f"(filter0.f),          [filter1]"f"(filter1.f),
+          [filter2]"f"(filter2.f),          [filter3]"f"(filter3.f),
+          [filter4]"f"(filter4.f),          [filter5]"f"(filter5.f)
         : "memory"
     );
 #else
@@ -1583,14 +1875,26 @@ void ff_put_vp8_epel16_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel8_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel8_h6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
     const uint64_t *filter = fourtap_subpel_filters[mx - 1];
     double ftmp[9];
     uint32_t tmp[1];
+    union av_intfloat64 filter0;
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
+    union av_intfloat64 filter5;
     DECLARE_VAR_ALL64;
+    filter0.i = filter[0];
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
+    filter5.i = filter[5];
 
     /*
     dst[0] = cm[(filter[2]*src[0] - filter[1]*src[-1] + filter[0]*src[-2] + filter[3]*src[1] - filter[4]*src[2] + filter[5]*src[ 3] + 64) >> 7];
@@ -1603,7 +1907,7 @@ void ff_put_vp8_epel8_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[7] = cm[(filter[2]*src[7] - filter[1]*src[ 6] + filter[0]*src[ 5] + filter[3]*src[8] - filter[4]*src[9] + filter[5]*src[10] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1623,12 +1927,12 @@ void ff_put_vp8_epel8_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           RESTRICT_ASM_ALL64
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter0]"f"(filter[0]),          [filter1]"f"(filter[1]),
-          [filter2]"f"(filter[2]),          [filter3]"f"(filter[3]),
-          [filter4]"f"(filter[4]),          [filter5]"f"(filter[5])
+          [filter0]"f"(filter0.f),          [filter1]"f"(filter1.f),
+          [filter2]"f"(filter2.f),          [filter3]"f"(filter3.f),
+          [filter4]"f"(filter4.f),          [filter5]"f"(filter5.f)
         : "memory"
     );
 #else
@@ -1645,14 +1949,26 @@ void ff_put_vp8_epel8_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel4_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel4_h6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
     const uint64_t *filter = fourtap_subpel_filters[mx - 1];
     double ftmp[6];
     uint32_t tmp[1];
+    union av_intfloat64 filter0;
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
+    union av_intfloat64 filter5;
     DECLARE_VAR_LOW32;
+    filter0.i = filter[0];
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
+    filter5.i = filter[5];
 
     /*
     dst[0] = cm[(filter[2]*src[0] - filter[1]*src[-1] + filter[0]*src[-2] + filter[3]*src[1] - filter[4]*src[2] + filter[5]*src[ 3] + 64) >> 7];
@@ -1661,7 +1977,7 @@ void ff_put_vp8_epel4_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[3] = cm[(filter[2]*src[3] - filter[1]*src[ 2] + filter[0]*src[ 1] + filter[3]*src[4] - filter[4]*src[5] + filter[5]*src[ 6] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1679,12 +1995,12 @@ void ff_put_vp8_epel4_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           RESTRICT_ASM_LOW32
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter0]"f"(filter[0]),          [filter1]"f"(filter[1]),
-          [filter2]"f"(filter[2]),          [filter3]"f"(filter[3]),
-          [filter4]"f"(filter[4]),          [filter5]"f"(filter[5])
+          [filter0]"f"(filter0.f),          [filter1]"f"(filter1.f),
+          [filter2]"f"(filter2.f),          [filter3]"f"(filter3.f),
+          [filter4]"f"(filter4.f),          [filter5]"f"(filter5.f)
         : "memory"
     );
 #else
@@ -1701,7 +2017,7 @@ void ff_put_vp8_epel4_h6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel16_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel16_v4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -1709,7 +2025,15 @@ void ff_put_vp8_epel16_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     double ftmp[9];
     uint32_t tmp[1];
     mips_reg src0, src1, dst0;
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
     DECLARE_VAR_ALL64;
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
 
     /*
     dst[0] = cm[(filter[2] * src[0] - filter[1] * src[ -srcstride] + filter[3] * src[  srcstride] - filter[4] * src[  2*srcstride] + 64) >> 7];
@@ -1731,7 +2055,7 @@ void ff_put_vp8_epel16_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[15] = cm[(filter[2] * src[15] - filter[1] * src[15-srcstride] + filter[3] * src[15+srcstride] - filter[4] * src[15+2*srcstride] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1758,11 +2082,11 @@ void ff_put_vp8_epel16_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter1]"f"(filter[1]),          [filter2]"f"(filter[2]),
-          [filter3]"f"(filter[3]),          [filter4]"f"(filter[4])
+          [filter1]"f"(filter1.f),          [filter2]"f"(filter2.f),
+          [filter3]"f"(filter3.f),          [filter4]"f"(filter4.f)
         : "memory"
     );
 #else
@@ -1779,7 +2103,7 @@ void ff_put_vp8_epel16_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel8_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel8_v4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -1787,7 +2111,15 @@ void ff_put_vp8_epel8_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     double ftmp[9];
     uint32_t tmp[1];
     mips_reg src1;
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
     DECLARE_VAR_ALL64;
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
 
     /*
     dst[0] = cm[(filter[2] * src[0] - filter[1] * src[ -srcstride] + filter[3] * src[  srcstride] - filter[4] * src[  2*srcstride] + 64) >> 7];
@@ -1800,7 +2132,7 @@ void ff_put_vp8_epel8_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[7] = cm[(filter[2] * src[7] - filter[1] * src[7-srcstride] + filter[3] * src[7+srcstride] - filter[4] * src[7+2*srcstride] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1821,11 +2153,11 @@ void ff_put_vp8_epel8_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter1]"f"(filter[1]),          [filter2]"f"(filter[2]),
-          [filter3]"f"(filter[3]),          [filter4]"f"(filter[4])
+          [filter1]"f"(filter1.f),          [filter2]"f"(filter2.f),
+          [filter3]"f"(filter3.f),          [filter4]"f"(filter4.f)
         : "memory"
     );
 #else
@@ -1842,7 +2174,7 @@ void ff_put_vp8_epel8_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel4_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel4_v4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -1850,7 +2182,15 @@ void ff_put_vp8_epel4_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     double ftmp[6];
     uint32_t tmp[1];
     mips_reg src1;
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
     DECLARE_VAR_LOW32;
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
 
     /*
     dst[0] = cm[(filter[2] * src[0] - filter[1] * src[ -srcstride] + filter[3] * src[  srcstride] - filter[4] * src[  2*srcstride] + 64) >> 7];
@@ -1859,7 +2199,7 @@ void ff_put_vp8_epel4_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[3] = cm[(filter[2] * src[3] - filter[1] * src[3-srcstride] + filter[3] * src[3+srcstride] - filter[4] * src[3+2*srcstride] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1878,11 +2218,11 @@ void ff_put_vp8_epel4_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter1]"f"(filter[1]),          [filter2]"f"(filter[2]),
-          [filter3]"f"(filter[3]),          [filter4]"f"(filter[4])
+          [filter1]"f"(filter1.f),          [filter2]"f"(filter2.f),
+          [filter3]"f"(filter3.f),          [filter4]"f"(filter4.f)
         : "memory"
     );
 #else
@@ -1899,7 +2239,7 @@ void ff_put_vp8_epel4_v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel16_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel16_v6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -1907,7 +2247,19 @@ void ff_put_vp8_epel16_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     double ftmp[9];
     uint32_t tmp[1];
     mips_reg src0, src1, dst0;
+    union av_intfloat64 filter0;
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
+    union av_intfloat64 filter5;
     DECLARE_VAR_ALL64;
+    filter0.i = filter[0];
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
+    filter5.i = filter[5];
 
     /*
     dst[0] = cm[(filter[2]*src[0] - filter[1]*src[0-srcstride] + filter[0]*src[0-2*srcstride] + filter[3]*src[0+srcstride] - filter[4]*src[0+2*srcstride] + filter[5]*src[0+3*srcstride] + 64) >> 7];
@@ -1929,7 +2281,7 @@ void ff_put_vp8_epel16_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[15] = cm[(filter[2]*src[15] - filter[1]*src[15-srcstride] + filter[0]*src[15-2*srcstride] + filter[3]*src[15+srcstride] - filter[4]*src[15+2*srcstride] + filter[5]*src[15+3*srcstride] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -1956,12 +2308,12 @@ void ff_put_vp8_epel16_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter0]"f"(filter[0]),          [filter1]"f"(filter[1]),
-          [filter2]"f"(filter[2]),          [filter3]"f"(filter[3]),
-          [filter4]"f"(filter[4]),          [filter5]"f"(filter[5])
+          [filter0]"f"(filter0.f),          [filter1]"f"(filter1.f),
+          [filter2]"f"(filter2.f),          [filter3]"f"(filter3.f),
+          [filter4]"f"(filter4.f),          [filter5]"f"(filter5.f)
         : "memory"
     );
 #else
@@ -1978,7 +2330,7 @@ void ff_put_vp8_epel16_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel8_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel8_v6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -1986,7 +2338,19 @@ void ff_put_vp8_epel8_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     double ftmp[9];
     uint32_t tmp[1];
     mips_reg src1;
+    union av_intfloat64 filter0;
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
+    union av_intfloat64 filter5;
     DECLARE_VAR_ALL64;
+    filter0.i = filter[0];
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
+    filter5.i = filter[5];
 
     /*
     dst[0] = cm[(filter[2]*src[0] - filter[1]*src[0-srcstride] + filter[0]*src[0-2*srcstride] + filter[3]*src[0+srcstride] - filter[4]*src[0+2*srcstride] + filter[5]*src[0+3*srcstride] + 64) >> 7];
@@ -1999,7 +2363,7 @@ void ff_put_vp8_epel8_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[7] = cm[(filter[2]*src[7] - filter[1]*src[7-srcstride] + filter[0]*src[7-2*srcstride] + filter[3]*src[7+srcstride] - filter[4]*src[7+2*srcstride] + filter[5]*src[7+3*srcstride] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -2020,12 +2384,12 @@ void ff_put_vp8_epel8_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter0]"f"(filter[0]),          [filter1]"f"(filter[1]),
-          [filter2]"f"(filter[2]),          [filter3]"f"(filter[3]),
-          [filter4]"f"(filter[4]),          [filter5]"f"(filter[5])
+          [filter0]"f"(filter0.f),          [filter1]"f"(filter1.f),
+          [filter2]"f"(filter2.f),          [filter3]"f"(filter3.f),
+          [filter4]"f"(filter4.f),          [filter5]"f"(filter5.f)
         : "memory"
     );
 #else
@@ -2042,7 +2406,7 @@ void ff_put_vp8_epel8_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel4_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel4_v6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2050,7 +2414,19 @@ void ff_put_vp8_epel4_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     double ftmp[6];
     uint32_t tmp[1];
     mips_reg src1;
+    union av_intfloat64 filter0;
+    union av_intfloat64 filter1;
+    union av_intfloat64 filter2;
+    union av_intfloat64 filter3;
+    union av_intfloat64 filter4;
+    union av_intfloat64 filter5;
     DECLARE_VAR_LOW32;
+    filter0.i = filter[0];
+    filter1.i = filter[1];
+    filter2.i = filter[2];
+    filter3.i = filter[3];
+    filter4.i = filter[4];
+    filter5.i = filter[5];
 
     /*
     dst[0] = cm[(filter[2]*src[0] - filter[1]*src[0-srcstride] + filter[0]*src[0-2*srcstride] + filter[3]*src[0+srcstride] - filter[4]*src[0+2*srcstride] + filter[5]*src[0+3*srcstride] + 64) >> 7];
@@ -2059,7 +2435,7 @@ void ff_put_vp8_epel4_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
     dst[3] = cm[(filter[2]*src[3] - filter[1]*src[3-srcstride] + filter[0]*src[3-2*srcstride] + filter[3]*src[3+srcstride] - filter[4]*src[3+2*srcstride] + filter[5]*src[3+3*srcstride] + 64) >> 7];
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x07                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
 
@@ -2078,12 +2454,12 @@ void ff_put_vp8_epel4_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),                  [src]"+&r"(src)
-        : [ff_pw_64]"f"(ff_pw_64),
+        : [ff_pw_64]"f"(ff_pw_64.f),
           [srcstride]"r"((mips_reg)srcstride),
           [dststride]"r"((mips_reg)dststride),
-          [filter0]"f"(filter[0]),          [filter1]"f"(filter[1]),
-          [filter2]"f"(filter[2]),          [filter3]"f"(filter[3]),
-          [filter4]"f"(filter[4]),          [filter5]"f"(filter[5])
+          [filter0]"f"(filter0.f),          [filter1]"f"(filter1.f),
+          [filter2]"f"(filter2.f),          [filter3]"f"(filter3.f),
+          [filter4]"f"(filter4.f),          [filter5]"f"(filter5.f)
         : "memory"
     );
 #else
@@ -2100,7 +2476,7 @@ void ff_put_vp8_epel4_v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel16_h4v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel16_h4v4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2139,7 +2515,7 @@ void ff_put_vp8_epel16_h4v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel8_h4v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel8_h4v4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2178,7 +2554,7 @@ void ff_put_vp8_epel8_h4v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel4_h4v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel4_h4v4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2216,7 +2592,7 @@ void ff_put_vp8_epel4_h4v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel16_h4v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel16_h4v6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2255,7 +2631,7 @@ void ff_put_vp8_epel16_h4v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel8_h4v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel8_h4v6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2294,7 +2670,7 @@ void ff_put_vp8_epel8_h4v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel4_h4v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel4_h4v6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2333,7 +2709,7 @@ void ff_put_vp8_epel4_h4v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel16_h6v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel16_h6v4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2372,7 +2748,7 @@ void ff_put_vp8_epel16_h6v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel8_h6v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel8_h6v4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2411,7 +2787,7 @@ void ff_put_vp8_epel8_h6v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel4_h6v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel4_h6v4_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2450,7 +2826,7 @@ void ff_put_vp8_epel4_h6v4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel16_h6v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel16_h6v6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2489,7 +2865,7 @@ void ff_put_vp8_epel16_h6v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel8_h6v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel8_h6v6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2528,7 +2904,7 @@ void ff_put_vp8_epel8_h6v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_epel4_h6v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+void ff_put_vp8_epel4_h6v6_mmi(uint8_t *dst, ptrdiff_t dststride, const uint8_t *src,
         ptrdiff_t srcstride, int h, int mx, int my)
 {
 #if 1
@@ -2567,15 +2943,17 @@ void ff_put_vp8_epel4_h6v6_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_bilinear16_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
+void ff_put_vp8_bilinear16_h_mmi(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
         ptrdiff_t sstride, int h, int mx, int my)
 {
 #if 1
-    int a = 8 - mx, b = mx;
+    union mmi_intfloat64 a, b;
     double ftmp[7];
     uint32_t tmp[1];
     mips_reg dst0, src0;
     DECLARE_VAR_ALL64;
+    a.i = 8 - mx;
+    b.i = mx;
 
     /*
     dst[0] = (a * src[0] + b * src[1] + 4) >> 3;
@@ -2597,7 +2975,7 @@ void ff_put_vp8_bilinear16_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
     dst[15] = (a * src[15] + b * src[16] + 4) >> 3;
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x03                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
         "pshufh     %[a],       %[a],           %[ftmp0]            \n\t"
@@ -2624,10 +3002,10 @@ void ff_put_vp8_bilinear16_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
           [dst0]"=&r"(dst0),            [src0]"=&r"(src0),
           [h]"+&r"(h),
           [dst]"+&r"(dst),              [src]"+&r"(src),
-          [a]"+&f"(a),                  [b]"+&f"(b)
+          [a]"+&f"(a.f),                [b]"+&f"(b.f)
         : [sstride]"r"((mips_reg)sstride),
           [dstride]"r"((mips_reg)dstride),
-          [ff_pw_4]"f"(ff_pw_4)
+          [ff_pw_4]"f"(ff_pw_4.f)
         : "memory"
     );
 #else
@@ -2643,15 +3021,17 @@ void ff_put_vp8_bilinear16_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_bilinear16_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
+void ff_put_vp8_bilinear16_v_mmi(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
         ptrdiff_t sstride, int h, int mx, int my)
 {
 #if 1
-    int c = 8 - my, d = my;
+    union mmi_intfloat64 c, d;
     double ftmp[7];
     uint32_t tmp[1];
     mips_reg src0, src1, dst0;
     DECLARE_VAR_ALL64;
+    c.i = 8 - my;
+    d.i = my;
 
     /*
     dst[0] = (c * src[0] + d * src[    sstride] + 4) >> 3;
@@ -2664,7 +3044,7 @@ void ff_put_vp8_bilinear16_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
     dst[7] = (c * src[7] + d * src[7 + sstride] + 4) >> 3;
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x03                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
         "pshufh     %[c],       %[c],           %[ftmp0]            \n\t"
@@ -2692,10 +3072,10 @@ void ff_put_vp8_bilinear16_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
           [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),              [src]"+&r"(src),
-          [c]"+&f"(c),                  [d]"+&f"(d)
+          [c]"+&f"(c.f),                [d]"+&f"(d.f)
         : [sstride]"r"((mips_reg)sstride),
           [dstride]"r"((mips_reg)dstride),
-          [ff_pw_4]"f"(ff_pw_4)
+          [ff_pw_4]"f"(ff_pw_4.f)
         : "memory"
     );
 #else
@@ -2711,7 +3091,7 @@ void ff_put_vp8_bilinear16_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_bilinear16_hv_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
+void ff_put_vp8_bilinear16_hv_mmi(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
         ptrdiff_t sstride, int h, int mx, int my)
 {
 #if 1
@@ -2745,14 +3125,16 @@ void ff_put_vp8_bilinear16_hv_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_bilinear8_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
+void ff_put_vp8_bilinear8_h_mmi(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
         ptrdiff_t sstride, int h, int mx, int my)
 {
 #if 1
-    int a = 8 - mx, b = mx;
+    union mmi_intfloat64 a, b;
     double ftmp[7];
     uint32_t tmp[1];
     DECLARE_VAR_ALL64;
+    a.i = 8 - mx;
+    b.i = mx;
 
     /*
     dst[0] = (a * src[0] + b * src[1] + 4) >> 3;
@@ -2765,7 +3147,7 @@ void ff_put_vp8_bilinear8_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
     dst[7] = (a * src[7] + b * src[8] + 4) >> 3;
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x03                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
         "pshufh     %[a],       %[a],           %[ftmp0]            \n\t"
@@ -2786,10 +3168,10 @@ void ff_put_vp8_bilinear8_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
           RESTRICT_ASM_ALL64
           [h]"+&r"(h),
           [dst]"+&r"(dst),              [src]"+&r"(src),
-          [a]"+&f"(a),                  [b]"+&f"(b)
+          [a]"+&f"(a.f),                [b]"+&f"(b.f)
         : [sstride]"r"((mips_reg)sstride),
           [dstride]"r"((mips_reg)dstride),
-          [ff_pw_4]"f"(ff_pw_4)
+          [ff_pw_4]"f"(ff_pw_4.f)
         : "memory"
     );
 #else
@@ -2805,15 +3187,17 @@ void ff_put_vp8_bilinear8_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_bilinear8_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
+void ff_put_vp8_bilinear8_v_mmi(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
         ptrdiff_t sstride, int h, int mx, int my)
 {
 #if 1
-    int c = 8 - my, d = my;
+    union mmi_intfloat64 c, d;
     double ftmp[7];
     uint32_t tmp[1];
     mips_reg src1;
     DECLARE_VAR_ALL64;
+    c.i = 8 - my;
+    d.i = my;
 
     /*
     dst[0] = (c * src[0] + d * src[    sstride] + 4) >> 3;
@@ -2826,7 +3210,7 @@ void ff_put_vp8_bilinear8_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
     dst[7] = (c * src[7] + d * src[7 + sstride] + 4) >> 3;
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x03                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
         "pshufh     %[c],       %[c],           %[ftmp0]            \n\t"
@@ -2848,10 +3232,10 @@ void ff_put_vp8_bilinear8_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
           [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),              [src]"+&r"(src),
-          [c]"+&f"(c),                  [d]"+&f"(d)
+          [c]"+&f"(c.f),                [d]"+&f"(d.f)
         : [sstride]"r"((mips_reg)sstride),
           [dstride]"r"((mips_reg)dstride),
-          [ff_pw_4]"f"(ff_pw_4)
+          [ff_pw_4]"f"(ff_pw_4.f)
         : "memory"
     );
 #else
@@ -2867,7 +3251,7 @@ void ff_put_vp8_bilinear8_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_bilinear8_hv_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
+void ff_put_vp8_bilinear8_hv_mmi(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
         ptrdiff_t sstride, int h, int mx, int my)
 {
 #if 1
@@ -2901,15 +3285,17 @@ void ff_put_vp8_bilinear8_hv_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_bilinear4_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
+void ff_put_vp8_bilinear4_h_mmi(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
         ptrdiff_t sstride, int h, int mx, int my)
 {
 #if 1
-    int a = 8 - mx, b = mx;
+    union mmi_intfloat64 a, b;
     double ftmp[5];
     uint32_t tmp[1];
     DECLARE_VAR_LOW32;
     DECLARE_VAR_ALL64;
+    a.i = 8 - mx;
+    b.i = mx;
 
     /*
     dst[0] = (a * src[0] + b * src[1] + 4) >> 3;
@@ -2918,7 +3304,7 @@ void ff_put_vp8_bilinear4_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
     dst[3] = (a * src[3] + b * src[4] + 4) >> 3;
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x03                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
         "pshufh     %[a],       %[a],           %[ftmp0]            \n\t"
@@ -2939,10 +3325,10 @@ void ff_put_vp8_bilinear4_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
           RESTRICT_ASM_ALL64
           [h]"+&r"(h),
           [dst]"+&r"(dst),              [src]"+&r"(src),
-          [a]"+&f"(a),                  [b]"+&f"(b)
+          [a]"+&f"(a.f),                [b]"+&f"(b.f)
         : [sstride]"r"((mips_reg)sstride),
           [dstride]"r"((mips_reg)dstride),
-          [ff_pw_4]"f"(ff_pw_4)
+          [ff_pw_4]"f"(ff_pw_4.f)
         : "memory"
     );
 #else
@@ -2958,16 +3344,18 @@ void ff_put_vp8_bilinear4_h_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_bilinear4_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
+void ff_put_vp8_bilinear4_v_mmi(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
         ptrdiff_t sstride, int h, int mx, int my)
 {
 #if 1
-    int c = 8 - my, d = my;
+    union mmi_intfloat64 c, d;
     double ftmp[7];
     uint32_t tmp[1];
     mips_reg src1;
     DECLARE_VAR_LOW32;
     DECLARE_VAR_ALL64;
+    c.i = 8 - my;
+    d.i = my;
 
     /*
     dst[0] = (c * src[0] + d * src[    sstride] + 4) >> 3;
@@ -2976,7 +3364,7 @@ void ff_put_vp8_bilinear4_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
     dst[3] = (c * src[3] + d * src[3 + sstride] + 4) >> 3;
     */
     __asm__ volatile (
-        "xor        %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],       %[ftmp0]            \n\t"
         "li         %[tmp0],    0x03                                \n\t"
         "mtc1       %[tmp0],    %[ftmp4]                            \n\t"
         "pshufh     %[c],       %[c],           %[ftmp0]            \n\t"
@@ -2998,10 +3386,10 @@ void ff_put_vp8_bilinear4_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
           [src1]"=&r"(src1),
           [h]"+&r"(h),
           [dst]"+&r"(dst),              [src]"+&r"(src),
-          [c]"+&f"(c),                  [d]"+&f"(d)
+          [c]"+&f"(c.f),                [d]"+&f"(d.f)
         : [sstride]"r"((mips_reg)sstride),
           [dstride]"r"((mips_reg)dstride),
-          [ff_pw_4]"f"(ff_pw_4)
+          [ff_pw_4]"f"(ff_pw_4.f)
         : "memory"
     );
 #else
@@ -3017,7 +3405,7 @@ void ff_put_vp8_bilinear4_v_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
 #endif
 }
 
-void ff_put_vp8_bilinear4_hv_mmi(uint8_t *dst, ptrdiff_t dstride, uint8_t *src,
+void ff_put_vp8_bilinear4_hv_mmi(uint8_t *dst, ptrdiff_t dstride, const uint8_t *src,
         ptrdiff_t sstride, int h, int mx, int my)
 {
 #if 1

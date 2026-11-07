@@ -54,30 +54,6 @@ SECTION .text
 %endif
 %endmacro
 
-%macro PMINSD 3
-%if cpuflag(sse4)
-    pminsd %1, %2
-%else
-    mova    %3, %2
-    pcmpgtd %3, %1
-    pand    %1, %3
-    pandn   %3, %2
-    por     %1, %3
-%endif
-%endmacro
-
-%macro PMAXSD 3
-%if cpuflag(sse4)
-    pmaxsd %1, %2
-%else
-    mova    %3, %1
-    pcmpgtd %3, %2
-    pand    %1, %3
-    pandn   %3, %2
-    por     %1, %3
-%endif
-%endmacro
-
 %macro PMAXUW 2
 %if cpuflag(sse4)
     pmaxuw %1, %2
@@ -96,7 +72,7 @@ SECTION .text
     pavgw     m5, m3
     pand      m4, [pw_1]
     psubusw   m5, m4
-    RSHIFT    m5, 2
+    psrldq    m5, 2
     punpcklwd m5, m7
     mova      m4, m2
     psubusw   m2, m3
@@ -104,8 +80,8 @@ SECTION .text
     PMAXUW    m2, m3
     mova      m3, m2
     mova      m4, m2
-    RSHIFT    m3, 2
-    RSHIFT    m4, 4
+    psrldq    m3, 2
+    psrldq    m4, 4
     punpcklwd m2, m7
     punpcklwd m3, m7
     punpcklwd m4, m7
@@ -210,7 +186,7 @@ SECTION .text
     psubusw      m3, m4
     PMAXUW       m2, m3
     mova         m3, m2
-    RSHIFT       m3, 4
+    psrldq       m3, 4
     punpcklwd    m2, m7
     punpcklwd    m3, m7
     paddd        m0, m2
@@ -311,7 +287,3 @@ INIT_XMM ssse3
 YADIF
 INIT_XMM sse2
 YADIF
-%if ARCH_X86_32
-INIT_MMX mmxext
-YADIF
-%endif

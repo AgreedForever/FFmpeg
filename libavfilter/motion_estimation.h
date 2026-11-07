@@ -21,7 +21,7 @@
 #ifndef AVFILTER_MOTION_ESTIMATION_H
 #define AVFILTER_MOTION_ESTIMATION_H
 
-#include "libavutil/avutil.h"
+#include <stdint.h>
 
 #define AV_ME_METHOD_ESA        1
 #define AV_ME_METHOD_TSS        2
@@ -40,7 +40,7 @@ typedef struct AVMotionEstPredictor {
 
 typedef struct AVMotionEstContext {
     uint8_t *data_cur, *data_ref;
-    int linesize;
+    int linesize_cur, linesize_ref;
 
     int mb_size;
     int search_param;

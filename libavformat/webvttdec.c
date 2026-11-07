@@ -21,12 +21,14 @@
 /**
  * @file
  * WebVTT subtitle demuxer
- * @see http://dev.w3.org/html5/webvtt/
+ * @see https://www.w3.org/TR/webvtt1/
  */
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "subtitles.h"
+#include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
@@ -35,9 +37,10 @@ typedef struct {
     const AVClass *class;
     FFDemuxSubtitlesQueue q;
     int kind;
+    int timestamp_map;
 } WebVTTContext;
 
-static int webvtt_probe(AVProbeData *p)
+static int webvtt_probe(const AVProbeData *p)
 {
     const uint8_t *ptr = p->buf;
 
@@ -57,21 +60,59 @@ static int64_t read_ts(const char *s)
     return AV_NOPTS_VALUE;
 }
 
+/* X-TIMESTAMP-MAP=LOCAL:<cue time>,MPEGTS:<MPEG-2 time>, in either order,
+ * on a header line of its own */
+static void parse_timestamp_map(AVFormatContext *s, const char *p,
+                                AVRational time_base, int64_t *offset)
+{
+    int64_t local = AV_NOPTS_VALUE, mpegts = AV_NOPTS_VALUE;
+
+    while (*p && !av_strstart(p, "X-TIMESTAMP-MAP=", NULL)) {
+        p += strcspn(p, "\r\n");
+        p += strspn(p, "\r\n");
+    }
+    if (!*p)
+        return;
+    p += strlen("X-TIMESTAMP-MAP=");
+    while (*p && *p != '\r' && *p != '\n') {
+        const char *val;
+        if (av_strstart(p, "LOCAL:", &val)) {
+            local = read_ts(val);
+        } else if (av_strstart(p, "MPEGTS:", &val)) {
+            char *end;
+            mpegts = strtoll(val, &end, 10);
+            if (end == val || (*end && !strchr(",\r\n", *end)) ||
+                mpegts < 0 || mpegts >= (1LL << 33))
+                mpegts = AV_NOPTS_VALUE;
+        }
+        p += strcspn(p, ",\r\n");
+        if (*p == ',')
+            p++;
+    }
+    if (local == AV_NOPTS_VALUE || mpegts == AV_NOPTS_VALUE) {
+        av_log(s, AV_LOG_WARNING, "Invalid X-TIMESTAMP-MAP header\n");
+        return;
+    }
+
+    *offset = av_rescale_q(mpegts, (AVRational){ 1, 90000 }, time_base) -
+              av_rescale_q(local, (AVRational){ 1, 1000 }, time_base);
+}
+
 static int webvtt_read_header(AVFormatContext *s)
 {
     WebVTTContext *webvtt = s->priv_data;
-    AVBPrint header, cue;
+    AVBPrint cue;
     int res = 0;
+    int64_t ts_offset = 0;
     AVStream *st = avformat_new_stream(s, NULL);
 
     if (!st)
         return AVERROR(ENOMEM);
-    avpriv_set_pts_info(st, 64, 1, 1000);
+    avpriv_set_pts_info(st, 64, 1, webvtt->timestamp_map ? 90000 : 1000);
     st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
     st->codecpar->codec_id   = AV_CODEC_ID_WEBVTT;
     st->disposition |= webvtt->kind;
 
-    av_bprint_init(&header, 0, AV_BPRINT_SIZE_UNLIMITED);
     av_bprint_init(&cue,    0, AV_BPRINT_SIZE_UNLIMITED);
 
     for (;;) {
@@ -79,10 +120,12 @@ static int webvtt_read_header(AVFormatContext *s)
         int64_t pos;
         AVPacket *sub;
         const char *p, *identifier, *settings;
-        int identifier_len, settings_len;
+        size_t identifier_len, settings_len;
         int64_t ts_start, ts_end;
 
-        ff_subtitles_read_chunk(s->pb, &cue);
+        res = ff_subtitles_read_chunk(s->pb, &cue);
+        if (res < 0)
+            goto end;
 
         if (!cue.len)
             break;
@@ -90,9 +133,17 @@ static int webvtt_read_header(AVFormatContext *s)
         p = identifier = cue.str;
         pos = avio_tell(s->pb);
 
-        /* ignore header chunk */
+        /* header chunk */
         if (!strncmp(p, "\xEF\xBB\xBFWEBVTT", 9) ||
             !strncmp(p, "WEBVTT", 6) ||
+            (!strncmp(p, "X-TIMESTAMP-MAP=", 16) && !strstr(p, "-->"))) {
+            if (webvtt->timestamp_map)
+                parse_timestamp_map(s, p, st->time_base, &ts_offset);
+            continue;
+        }
+
+        if (!strncmp(p, "STYLE", 5) ||
+            !strncmp(p, "REGION", 6) ||
             !strncmp(p, "NOTE", 4))
             continue;
 
@@ -126,7 +177,7 @@ static int webvtt_read_header(AVFormatContext *s)
             break;
 
         /* optional cue settings */
-        p += strcspn(p, "\n\t ");
+        p += strcspn(p, "\n\r\t ");
         while (*p == '\t' || *p == ' ')
             p++;
         settings = p;
@@ -144,8 +195,10 @@ static int webvtt_read_header(AVFormatContext *s)
             goto end;
         }
         sub->pos = pos;
-        sub->pts = ts_start;
-        sub->duration = ts_end - ts_start;
+        sub->pts = av_rescale_q(ts_start, (AVRational){ 1, 1000 }, st->time_base) +
+                   ts_offset;
+        sub->duration = av_rescale_q(ts_end - ts_start, (AVRational){ 1, 1000 },
+                                     st->time_base);
 
 #define SET_SIDE_DATA(name, type) do {                                  \
     if (name##_len) {                                                   \
@@ -166,7 +219,6 @@ static int webvtt_read_header(AVFormatContext *s)
 
 end:
     av_bprint_finalize(&cue,    NULL);
-    av_bprint_finalize(&header, NULL);
     return res;
 }
 
@@ -192,14 +244,15 @@ static int webvtt_read_close(AVFormatContext *s)
 }
 
 #define OFFSET(x) offsetof(WebVTTContext, x)
-#define KIND_FLAGS AV_OPT_FLAG_SUBTITLE_PARAM
+#define KIND_FLAGS AV_OPT_FLAG_SUBTITLE_PARAM|AV_OPT_FLAG_DECODING_PARAM
 
 static const AVOption options[] = {
-    { "kind", "Set kind of WebVTT track", OFFSET(kind), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, KIND_FLAGS, "webvtt_kind" },
-        { "subtitles",    "WebVTT subtitles kind",    0, AV_OPT_TYPE_CONST, { .i64 = 0 },                           INT_MIN, INT_MAX, 0, "webvtt_kind" },
-        { "captions",     "WebVTT captions kind",     0, AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_CAPTIONS },     INT_MIN, INT_MAX, 0, "webvtt_kind" },
-        { "descriptions", "WebVTT descriptions kind", 0, AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_DESCRIPTIONS }, INT_MIN, INT_MAX, 0, "webvtt_kind" },
-        { "metadata",     "WebVTT metadata kind",     0, AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_METADATA },     INT_MIN, INT_MAX, 0, "webvtt_kind" },
+    { "kind", "Set kind of WebVTT track", OFFSET(kind), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, KIND_FLAGS, .unit = "webvtt_kind" },
+        { "subtitles",    "WebVTT subtitles kind",    0, AV_OPT_TYPE_CONST, { .i64 = 0 },                           INT_MIN, INT_MAX, KIND_FLAGS, .unit = "webvtt_kind" },
+        { "captions",     "WebVTT captions kind",     0, AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_CAPTIONS },     INT_MIN, INT_MAX, KIND_FLAGS, .unit = "webvtt_kind" },
+        { "descriptions", "WebVTT descriptions kind", 0, AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_DESCRIPTIONS }, INT_MIN, INT_MAX, KIND_FLAGS, .unit = "webvtt_kind" },
+        { "metadata",     "WebVTT metadata kind",     0, AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_METADATA },     INT_MIN, INT_MAX, KIND_FLAGS, .unit = "webvtt_kind" },
+    { "timestamp_map", "Apply the X-TIMESTAMP-MAP header to the cue timestamps, in the 90 kHz MPEG-TS time base", OFFSET(timestamp_map), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, KIND_FLAGS },
     { NULL }
 };
 
@@ -210,15 +263,17 @@ static const AVClass webvtt_demuxer_class = {
     .version     = LIBAVUTIL_VERSION_INT,
 };
 
-AVInputFormat ff_webvtt_demuxer = {
-    .name           = "webvtt",
-    .long_name      = NULL_IF_CONFIG_SMALL("WebVTT subtitle"),
+const FFInputFormat ff_webvtt_demuxer = {
+    .p.name         = "webvtt",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("WebVTT subtitle"),
+    .p.mime_type    = "text/vtt",
+    .p.extensions   = "vtt,webvtt",
+    .p.priv_class   = &webvtt_demuxer_class,
     .priv_data_size = sizeof(WebVTTContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = webvtt_probe,
     .read_header    = webvtt_read_header,
     .read_packet    = webvtt_read_packet,
     .read_seek2     = webvtt_read_seek,
     .read_close     = webvtt_read_close,
-    .extensions     = "vtt",
-    .priv_class     = &webvtt_demuxer_class,
 };

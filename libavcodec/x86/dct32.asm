@@ -23,7 +23,8 @@
 
 SECTION_RODATA 32
 
-align 32
+ps_p1p1m1m1: dd 0, 0, 0x80000000, 0x80000000, 0, 0, 0x80000000, 0x80000000
+
 ps_cos_vec: dd   0.500603,  0.505471,  0.515447,  0.531043
             dd   0.553104,  0.582935,  0.622504,  0.674808
             dd -10.190008, -3.407609, -2.057781, -1.484165
@@ -37,9 +38,6 @@ ps_cos_vec: dd   0.500603,  0.505471,  0.515447,  0.531043
             dd   1.000000,  0.707107,  1.000000, -0.707107
             dd   1.000000,  0.707107,  1.000000, -0.707107
             dd   0.707107,  0.707107,  0.707107,  0.707107
-
-align 32
-ps_p1p1m1m1: dd 0, 0, 0x80000000, 0x80000000, 0, 0, 0x80000000, 0x80000000
 
 %macro BUTTERFLY 4
     subps  %4, %1, %2
@@ -196,15 +194,15 @@ SECTION .text
 ; void ff_dct32_float_avx(FFTSample *out, const FFTSample *in)
 cglobal dct32_float, 2,3,8, out, in, tmp
     ; pass 1
+    vmovaps    xm5, [inq+112]
     vmovaps     m4, [inq+0]
     vinsertf128 m5, m5, [inq+96], 1
-    vinsertf128 m5, m5, [inq+112], 0
     vshufps     m5, m5, m5, 0x1b
     BUTTERFLY   m4, m5, [ps_cos_vec], m6
 
+    vmovaps    xm6, [inq+48]
     vmovaps     m2, [inq+64]
     vinsertf128 m6, m6, [inq+32], 1
-    vinsertf128 m6, m6, [inq+48], 0
     vshufps     m6, m6, m6, 0x1b
     BUTTERFLY   m2, m6, [ps_cos_vec+32], m0
 
@@ -251,10 +249,10 @@ cglobal dct32_float, 2,3,8, out, in, tmp
     vmovaps [outq], m3
 
     vextractf128  [outq+64], m5, 1
-    vextractf128  [outq+32], m5, 0
+    vmovaps       [outq+32], xm5
 
     vextractf128  [outq+80], m4, 1
-    vextractf128  [outq+48], m4, 0
+    vmovaps       [outq+48], xm4
 
     vperm2f128  m0, m1, m1, 0x31
     vmovaps [outq+96], m1
@@ -262,7 +260,7 @@ cglobal dct32_float, 2,3,8, out, in, tmp
     vzeroupper
 
     ;    pass 6, no SIMD...
-INIT_XMM
+INIT_XMM avx
     PASS6_AND_PERMUTE
     RET
 %endif
@@ -389,7 +387,7 @@ INIT_XMM
 %endif
 
 
-; void ff_dct32_float_sse(FFTSample *out, const FFTSample *in)
+; void ff_dct32_float(FFTSample *out, const FFTSample *in)
 %macro DCT32_FUNC 0
 cglobal dct32_float, 2, 3, 16, out, in, tmp
     ; pass 1
@@ -476,18 +474,8 @@ cglobal dct32_float, 2, 3, 16, out, in, tmp
 %endmacro
 
 %macro LOAD_INV 2
-%if cpuflag(sse2)
     pshufd      %1, %2, 0x1b
-%elif cpuflag(sse)
-    movaps      %1, %2
-    shufps      %1, %1, 0x1b
-%endif
 %endmacro
-
-%if ARCH_X86_32
-INIT_XMM sse
-DCT32_FUNC
-%endif
 
 INIT_XMM sse2
 DCT32_FUNC

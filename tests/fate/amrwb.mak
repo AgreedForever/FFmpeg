@@ -41,7 +41,27 @@ FATE_AMRWB += fate-amrwb-23k85-2
 fate-amrwb-23k85-2: CMD = pcm -i $(TARGET_SAMPLES)/amrwb/deus-23k85.awb
 fate-amrwb-23k85-2: REF = $(SAMPLES)/amrwb/deus-23k85.pcm
 
+FATE_AMRWB_REMUX-$(call REMUX, AMR, MOV_DEMUXER AMR_PARSER) += fate-amrwb-remux
+fate-amrwb-remux: CMD = transcode mov $(TARGET_SAMPLES)/amrwb/seed-23k85.awb amr "-c copy" "-c copy -t 1"
+
 $(FATE_AMRWB): CMP = stddev
 
-FATE_SAMPLES_AVCONV-$(call DEMDEC, AMR, AMRWB) += $(FATE_AMRWB)
-fate-amrwb: $(FATE_AMRWB)
+# Check that SID frames are decoded to comfort noise instead of being dropped,
+# so that a stream using DTX keeps its duration (see ticket #24921).
+FATE_AMRWB_DTX-$(call ALLYES, AMR_DEMUXER AMR_PARSER AMRWB_DECODER ARESAMPLE_FILTER \
+                              ASTATS_FILTER PCM_F32LE_ENCODER NULL_MUXER FILE_PROTOCOL) += fate-amrwb-dtx-duration
+FATE_AMRWB_DTX-$(call ALLYES, AMR_DEMUXER AMR_PARSER AMRWB_DECODER ARESAMPLE_FILTER \
+                              ASTATS_FILTER ATRIM_FILTER PCM_F32LE_ENCODER NULL_MUXER \
+                              FILE_PROTOCOL) += fate-amrwb-dtx-cn
+fate-amrwb-dtx-duration fate-amrwb-dtx-cn: tests/data/fate/amrwb-dtx.amr
+fate-amrwb-dtx-duration: CMD = ffmpeg -i $(TARGET_PATH)/tests/data/fate/amrwb-dtx.amr -af "aresample=osf=flt,astats=metadata=0:reset=0" -c:a pcm_f32le -f null -
+fate-amrwb-dtx-duration: CMP = grep
+fate-amrwb-dtx-duration: REF = Number of samples: 3520
+fate-amrwb-dtx-cn: CMD = ffmpeg -i $(TARGET_PATH)/tests/data/fate/amrwb-dtx.amr -af "atrim=start_sample=320:end_sample=3520,aresample=osf=flt,astats=metadata=0:reset=0" -c:a pcm_f32le -f null -
+fate-amrwb-dtx-cn: CMP = grep
+fate-amrwb-dtx-cn: REF = RMS level dB: -19\.
+
+FATE_SAMPLES_FFMPEG-$(call PCM, MOV, AMRWB, ARESAMPLE_FILTER) += $(FATE_AMRWB)
+FATE_FFMPEG += $(FATE_AMRWB_DTX-yes)
+FATE_SAMPLES_FFMPEG += $(FATE_AMRWB_REMUX-yes)
+fate-amrwb: $(FATE_AMRWB) $(FATE_AMRWB_REMUX-yes) $(FATE_AMRWB_DTX-yes)

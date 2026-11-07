@@ -19,12 +19,16 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/avstring.h"
 #include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/parseutils.h"
 #include "avcodec.h"
 #include "ass.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "htmlsubtitles.h"
 
 static int srt_to_ass(AVCodecContext *avctx, AVBPrint *dst,
@@ -52,13 +56,13 @@ static int srt_to_ass(AVCodecContext *avctx, AVBPrint *dst,
     return ff_htmlmarkup_to_ass(avctx, dst, in);
 }
 
-static int srt_decode_frame(AVCodecContext *avctx,
-                            void *data, int *got_sub_ptr, AVPacket *avpkt)
+static int srt_decode_frame(AVCodecContext *avctx, AVSubtitle *sub,
+                            int *got_sub_ptr, const AVPacket *avpkt)
 {
-    AVSubtitle *sub = data;
     AVBPrint buffer;
     int x1 = -1, y1 = -1, x2 = -1, y2 = -1;
-    int size, ret;
+    int ret;
+    size_t size;
     const uint8_t *p = av_packet_get_side_data(avpkt, AV_PKT_DATA_SUBTITLE_POSITION, &size);
     FFASSDecoderContext *s = avctx->priv_data;
 
@@ -72,9 +76,13 @@ static int srt_decode_frame(AVCodecContext *avctx,
     if (avpkt->size <= 0)
         return avpkt->size;
 
+    const char *text = ff_decode_subtitle_text(avctx, avpkt);
+    if (!text)
+        return AVERROR(ENOMEM);
+
     av_bprint_init(&buffer, 0, AV_BPRINT_SIZE_UNLIMITED);
 
-    ret = srt_to_ass(avctx, &buffer, avpkt->data, x1, y1, x2, y2);
+    ret = srt_to_ass(avctx, &buffer, text, x1, y1, x2, y2);
     if (ret >= 0)
         ret = ff_ass_add_rect(sub, buffer.str, s->readorder++, 0, NULL, NULL);
     av_bprint_finalize(&buffer, NULL);
@@ -87,26 +95,26 @@ static int srt_decode_frame(AVCodecContext *avctx,
 
 #if CONFIG_SRT_DECODER
 /* deprecated decoder */
-AVCodec ff_srt_decoder = {
-    .name         = "srt",
-    .long_name    = NULL_IF_CONFIG_SMALL("SubRip subtitle"),
-    .type         = AVMEDIA_TYPE_SUBTITLE,
-    .id           = AV_CODEC_ID_SUBRIP,
+const FFCodec ff_srt_decoder = {
+    .p.name       = "srt",
+    CODEC_LONG_NAME("SubRip subtitle"),
+    .p.type       = AVMEDIA_TYPE_SUBTITLE,
+    .p.id         = AV_CODEC_ID_SUBRIP,
     .init         = ff_ass_subtitle_header_default,
-    .decode       = srt_decode_frame,
+    FF_CODEC_DECODE_SUB_CB(srt_decode_frame),
     .flush        = ff_ass_decoder_flush,
     .priv_data_size = sizeof(FFASSDecoderContext),
 };
 #endif
 
 #if CONFIG_SUBRIP_DECODER
-AVCodec ff_subrip_decoder = {
-    .name         = "subrip",
-    .long_name    = NULL_IF_CONFIG_SMALL("SubRip subtitle"),
-    .type         = AVMEDIA_TYPE_SUBTITLE,
-    .id           = AV_CODEC_ID_SUBRIP,
+const FFCodec ff_subrip_decoder = {
+    .p.name       = "subrip",
+    CODEC_LONG_NAME("SubRip subtitle"),
+    .p.type       = AVMEDIA_TYPE_SUBTITLE,
+    .p.id         = AV_CODEC_ID_SUBRIP,
     .init         = ff_ass_subtitle_header_default,
-    .decode       = srt_decode_frame,
+    FF_CODEC_DECODE_SUB_CB(srt_decode_frame),
     .flush        = ff_ass_decoder_flush,
     .priv_data_size = sizeof(FFASSDecoderContext),
 };

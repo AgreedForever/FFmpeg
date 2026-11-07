@@ -26,23 +26,20 @@
  * @see http://bespin.org/~qz/pc-gpe/pcx.txt
  */
 
+#include "libavutil/imgutils_internal.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "libavutil/imgutils.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 
 static const uint32_t monoblack_pal[16] = { 0x000000, 0xFFFFFF };
 
-static av_cold int pcx_encode_init(AVCodecContext *avctx)
+static uint8_t *put_run(uint8_t *dst, uint8_t value, int count)
 {
-#if FF_API_CODED_FRAME
-FF_DISABLE_DEPRECATION_WARNINGS
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
-    avctx->coded_frame->key_frame = 1;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-
-    return 0;
+    if (count != 1 || value >= 0xC0)
+        *dst++ = 0xC0 | count;
+    *dst++ = value;
+    return dst;
 }
 
 /**
@@ -50,7 +47,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
  * @param dst output buffer
  * @param dst_size size of output buffer
  * @param src input buffer
- * @param src_plane_size size of one plane of input buffer in bytes
+ * @param src_plane_size size of one plane of input buffer in bytes, an odd
+ *                       size is padded with a zero byte
  * @param nplanes number of planes in input buffer
  * @return number of bytes written to dst or -1 on error
  * @bug will not work for nplanes != 1 && bpp != 8
@@ -60,36 +58,35 @@ static int pcx_rle_encode(      uint8_t *dst, int dst_size,
 {
     int p;
     const uint8_t *dst_start = dst;
+    int pad = src_plane_size & 1;
 
     // check worst-case upper bound on dst_size
-    if (dst_size < 2LL * src_plane_size * nplanes || src_plane_size <= 0)
+    if (dst_size < 2LL * (src_plane_size + pad) * nplanes || src_plane_size <= 0)
         return AVERROR(EINVAL);
 
     for (p = 0; p < nplanes; p++) {
-        int count = 1;
+        int count = 1, i, zero_pad = pad;
         const uint8_t *src_plane = src + p;
-        const uint8_t *src_plane_end = src_plane + src_plane_size * nplanes;
         uint8_t prev = *src_plane;
-        src_plane += nplanes;
 
-        for (; ; src_plane += nplanes) {
-            if (src_plane < src_plane_end && *src_plane == prev && count < 0x3F) {
-                // current byte is same as prev
+        for (i = 1; i < src_plane_size; i++) {
+            uint8_t cur = src_plane[i * nplanes];
+
+            if (cur == prev && count < 0x3F) {
                 ++count;
-            } else {
-                // output prev * count
-                if (count != 1 || prev >= 0xC0)
-                    *dst++ = 0xC0 | count;
-                *dst++ = prev;
-
-                if (src_plane == src_plane_end)
-                    break;
-
-                // start new run
-                count = 1;
-                prev = *src_plane;
+                continue;
             }
+            dst = put_run(dst, prev, count);
+            count = 1;
+            prev = cur;
         }
+        if (zero_pad && !prev && count < 0x3F) {
+            count++;
+            zero_pad = 0;
+        }
+        dst = put_run(dst, prev, count);
+        if (zero_pad)
+            *dst++ = 0;
     }
 
     return dst - dst_start;
@@ -101,7 +98,7 @@ static int pcx_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     const uint8_t *buf_end;
     uint8_t *buf;
 
-    int bpp, nplanes, i, y, line_bytes, written, ret, max_pkt_size, sw, sh;
+    int bpp, nplanes, i, y, line_bytes, src_plane_size, written, ret, max_pkt_size, sw, sh;
     const uint32_t *pal = NULL;
     uint32_t palette256[256];
     const uint8_t *src;
@@ -141,11 +138,11 @@ static int pcx_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         return AVERROR(EINVAL);
     }
 
-    line_bytes = (avctx->width * bpp + 7) >> 3;
-    line_bytes = (line_bytes + 1) & ~1;
+    src_plane_size = (avctx->width * bpp + 7) >> 3;
+    line_bytes = (src_plane_size + 1) & ~1;
 
     max_pkt_size = 128 + avctx->height * 2 * line_bytes * nplanes + (pal ? 256*3 + 1 : 0);
-    if ((ret = ff_alloc_packet2(avctx, pkt, max_pkt_size, 0)) < 0)
+    if ((ret = ff_alloc_packet(avctx, pkt, max_pkt_size)) < 0)
         return ret;
     buf     = pkt->data;
     buf_end = pkt->data + pkt->size;
@@ -178,7 +175,7 @@ static int pcx_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     for (y = 0; y < avctx->height; y++) {
         if ((written = pcx_rle_encode(buf, buf_end - buf,
-                                      src, line_bytes, nplanes)) < 0) {
+                                      src, src_plane_size, nplanes)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "buffer too small\n");
             return AVERROR_BUG;
         }
@@ -198,24 +195,21 @@ static int pcx_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     }
 
     pkt->size   = buf - pkt->data;
-    pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
 
     return 0;
 }
 
-AVCodec ff_pcx_encoder = {
-    .name           = "pcx",
-    .long_name      = NULL_IF_CONFIG_SMALL("PC Paintbrush PCX image"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_PCX,
-    .init           = pcx_encode_init,
-    .encode2        = pcx_encode_frame,
-    .pix_fmts       = (const enum AVPixelFormat[]){
-        AV_PIX_FMT_RGB24,
-        AV_PIX_FMT_RGB8, AV_PIX_FMT_BGR8, AV_PIX_FMT_RGB4_BYTE, AV_PIX_FMT_BGR4_BYTE,
-        AV_PIX_FMT_GRAY8, AV_PIX_FMT_PAL8,
-        AV_PIX_FMT_MONOBLACK,
-        AV_PIX_FMT_NONE
-    },
+const FFCodec ff_pcx_encoder = {
+    .p.name         = "pcx",
+    CODEC_LONG_NAME("PC Paintbrush PCX image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_PCX,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    FF_CODEC_ENCODE_CB(pcx_encode_frame),
+    CODEC_PIXFMTS(AV_PIX_FMT_RGB24,
+                  AV_PIX_FMT_RGB8, AV_PIX_FMT_BGR8,
+                  AV_PIX_FMT_RGB4_BYTE, AV_PIX_FMT_BGR4_BYTE,
+                  AV_PIX_FMT_GRAY8, AV_PIX_FMT_PAL8,
+                  AV_PIX_FMT_MONOBLACK),
 };

@@ -28,10 +28,6 @@
 
 #include "config.h"
 
-#if HAVE_ALTIVEC_H
-#include <altivec.h>
-#endif
-
 /***********************************************************************
  * Vector types
  **********************************************************************/
@@ -56,6 +52,7 @@
 #define zero_s32v (vec_s32) zerov
 
 #if HAVE_ALTIVEC
+#include <altivec.h>
 
 // used to build registers permutation vectors (vcprm)
 // the 's' are for words in the _s_econd vector
@@ -145,6 +142,24 @@ static inline vec_u8 load_with_perm_vec(int offset, const uint8_t *src, vec_u8 p
 #else
 #define unaligned_load(a,b) VEC_LD(a,b)
 #define load_with_perm_vec(a,b,c) VEC_LD(a,b)
+#endif
+
+#if HAVE_BIGENDIAN
+static inline void unaligned_store(vec_u8 v, uint8_t *dst)
+{
+    vec_u8 lo    = vec_ld(0, dst);
+    vec_u8 hi    = vec_ld(15, dst);
+    vec_u8 edges = vec_perm(hi, lo, vec_lvsl(0, dst));
+    vec_u8 align = vec_lvsr(0, dst);
+
+    vec_st(vec_perm(v, edges, align), 15, dst);
+    vec_st(vec_perm(edges, v, align), 0, dst);
+}
+#else
+static inline void unaligned_store(vec_u8 v, uint8_t *dst)
+{
+    vec_vsx_st(v, 0, dst);
+}
 #endif
 
 

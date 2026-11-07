@@ -23,15 +23,12 @@
 #include "config.h"
 
 #include "libavutil/attributes.h"
-#include "libavutil/cpu.h"
-#include "libavutil/ppc/cpu.h"
 #include "libavutil/ppc/util_altivec.h"
 
 #include "libavcodec/hpeldsp.h"
 
 #include "hpeldsp_altivec.h"
 
-#if HAVE_ALTIVEC
 /* next one assumes that ((line_size % 16) == 0) */
 void ff_put_pixels16_altivec(uint8_t *block, const uint8_t *pixels, ptrdiff_t line_size, int h)
 {
@@ -41,12 +38,12 @@ void ff_put_pixels16_altivec(uint8_t *block, const uint8_t *pixels, ptrdiff_t li
     register vector unsigned char pixelsv1D;
 
     int i;
-    register ptrdiff_t line_size_2 = line_size << 1;
+    register ptrdiff_t line_size_2 = line_size * (1 << 1);
     register ptrdiff_t line_size_3 = line_size + line_size_2;
-    register ptrdiff_t line_size_4 = line_size << 2;
+    register ptrdiff_t line_size_4 = line_size * (1 << 2);
 
 // hand-unrolling the loop by 4 gains about 15%
-// mininum execution time goes from 74 to 60 cycles
+// minimum execution time goes from 74 to 60 cycles
 // it's faster than -funroll-loops, but using
 // -funroll-loops w/ this is bad - 74 cycles again.
 // all this is on a 7450, tuning for the 7450
@@ -84,7 +81,7 @@ void ff_avg_pixels16_altivec(uint8_t *block, const uint8_t *pixels, ptrdiff_t li
 /* next one assumes that ((line_size % 8) == 0) */
 static void avg_pixels8_altivec(uint8_t * block, const uint8_t * pixels, ptrdiff_t line_size, int h)
 {
-    register vector unsigned char pixelsv1, pixelsv2, pixelsv, blockv;
+    register vector unsigned char pixelsv, blockv;
     int i;
 
    for (i = 0; i < h; i++) {
@@ -363,14 +360,9 @@ static void avg_pixels8_xy2_altivec(uint8_t *block, const uint8_t *pixels, ptrdi
         pixels += line_size;
     }
 }
-#endif /* HAVE_ALTIVEC */
 
-av_cold void ff_hpeldsp_init_ppc(HpelDSPContext *c, int flags)
+av_cold void ff_hpeldsp_init_altivec(HpelDSPContext *c, int flags)
 {
-#if HAVE_ALTIVEC
-    if (!PPC_ALTIVEC(av_get_cpu_flags()))
-        return;
-
     c->avg_pixels_tab[0][0]        = ff_avg_pixels16_altivec;
     c->avg_pixels_tab[1][0]        = avg_pixels8_altivec;
     c->avg_pixels_tab[1][3]        = avg_pixels8_xy2_altivec;
@@ -382,5 +374,4 @@ av_cold void ff_hpeldsp_init_ppc(HpelDSPContext *c, int flags)
     c->put_no_rnd_pixels_tab[0][0] = ff_put_pixels16_altivec;
     c->put_no_rnd_pixels_tab[1][3] = put_no_rnd_pixels8_xy2_altivec;
     c->put_no_rnd_pixels_tab[0][3] = put_no_rnd_pixels16_xy2_altivec;
-#endif /* HAVE_ALTIVEC */
 }

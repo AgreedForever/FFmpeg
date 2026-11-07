@@ -18,10 +18,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "mlz.h"
 
-av_cold void ff_mlz_init_dict(void* context, MLZ *mlz) {
-    mlz->dict = av_mallocz_array(TABLE_SIZE, sizeof(*mlz->dict));
+av_cold int ff_mlz_init_dict(void *context, MLZ *mlz)
+{
+    mlz->dict = av_mallocz(TABLE_SIZE * sizeof(*mlz->dict));
+    if (!mlz->dict)
+        return AVERROR(ENOMEM);
 
     mlz->flush_code            = FLUSH_CODE;
     mlz->current_dic_index_max = DIC_INDEX_INIT;
@@ -30,6 +34,8 @@ av_cold void ff_mlz_init_dict(void* context, MLZ *mlz) {
     mlz->next_code             = FIRST_CODE;
     mlz->freeze_flag           = 0;
     mlz->context               = context;
+
+    return 0;
 }
 
 av_cold void ff_mlz_flush_dict(MLZ *mlz) {
@@ -153,6 +159,10 @@ int ff_mlz_decompression(MLZ* mlz, GetBitContext* gb, int size, unsigned char *b
                     mlz->bump_code = mlz->current_dic_index_max - 1;
                 } else {
                     if (string_code >= mlz->next_code) {
+                        if (string_code > mlz->next_code || last_string_code == CODE_UNSET) {
+                            av_log(mlz->context, AV_LOG_ERROR, "String code %d is not in the dictionary\n", string_code);
+                            return output_chars;
+                        }
                         int ret = decode_string(mlz, &buff[output_chars], last_string_code, &char_code, size - output_chars);
                         if (ret < 0 || ret > size - output_chars) {
                             av_log(mlz->context, AV_LOG_ERROR, "output chars overflow\n");

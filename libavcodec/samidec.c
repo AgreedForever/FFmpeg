@@ -25,8 +25,11 @@
  */
 
 #include "ass.h"
+#include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
+#include "libavutil/mem.h"
+#include "codec_internal.h"
 #include "htmlsubtitles.h"
 
 typedef struct {
@@ -38,15 +41,18 @@ typedef struct {
     int readorder;
 } SAMIContext;
 
-static int sami_paragraph_to_ass(AVCodecContext *avctx, const char *src)
+static int sami_paragraph_to_ass(AVCodecContext *avctx, const char *src, size_t size)
 {
     SAMIContext *sami = avctx->priv_data;
     int ret = 0;
     char *tag = NULL;
-    char *dupsrc = av_strdup(src);
+    char *dupsrc = av_strndup(src, size);
     char *p = dupsrc;
     AVBPrint *dst_content = &sami->encoded_content;
     AVBPrint *dst_source = &sami->encoded_source;
+
+    if (!dupsrc)
+        return AVERROR(ENOMEM);
 
     av_bprint_clear(&sami->encoded_content);
     av_bprint_clear(&sami->content);
@@ -128,16 +134,17 @@ end:
     return ret;
 }
 
-static int sami_decode_frame(AVCodecContext *avctx,
-                             void *data, int *got_sub_ptr, AVPacket *avpkt)
+static int sami_decode_frame(AVCodecContext *avctx, AVSubtitle *sub,
+                             int *got_sub_ptr, const AVPacket *avpkt)
 {
-    AVSubtitle *sub = data;
-    const char *ptr = avpkt->data;
     SAMIContext *sami = avctx->priv_data;
 
-    if (ptr && avpkt->size > 0 && !sami_paragraph_to_ass(avctx, ptr)) {
+    if (avpkt->data && avpkt->size > 0) {
+        int ret = sami_paragraph_to_ass(avctx, avpkt->data, avpkt->size);
+        if (ret < 0)
+            return ret;
         // TODO: pass escaped sami->encoded_source.str as source
-        int ret = ff_ass_add_rect(sub, sami->full.str, sami->readorder++, 0, NULL, NULL);
+        ret = ff_ass_add_rect(sub, sami->full.str, sami->readorder++, 0, NULL, NULL);
         if (ret < 0)
             return ret;
     }
@@ -167,21 +174,21 @@ static av_cold int sami_close(AVCodecContext *avctx)
     return 0;
 }
 
-static void sami_flush(AVCodecContext *avctx)
+static av_cold void sami_flush(AVCodecContext *avctx)
 {
     SAMIContext *sami = avctx->priv_data;
     if (!(avctx->flags2 & AV_CODEC_FLAG2_RO_FLUSH_NOOP))
         sami->readorder = 0;
 }
 
-AVCodec ff_sami_decoder = {
-    .name           = "sami",
-    .long_name      = NULL_IF_CONFIG_SMALL("SAMI subtitle"),
-    .type           = AVMEDIA_TYPE_SUBTITLE,
-    .id             = AV_CODEC_ID_SAMI,
+const FFCodec ff_sami_decoder = {
+    .p.name         = "sami",
+    CODEC_LONG_NAME("SAMI subtitle"),
+    .p.type         = AVMEDIA_TYPE_SUBTITLE,
+    .p.id           = AV_CODEC_ID_SAMI,
     .priv_data_size = sizeof(SAMIContext),
     .init           = sami_init,
     .close          = sami_close,
-    .decode         = sami_decode_frame,
+    FF_CODEC_DECODE_SUB_CB(sami_decode_frame),
     .flush          = sami_flush,
 };

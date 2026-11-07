@@ -21,7 +21,6 @@
 #define TEST 1
 #include "libavutil/random_seed.c"
 
-#undef printf
 #define N 256
 #define F 2
 #include <stdio.h>
@@ -47,7 +46,7 @@ int main(void)
             retry:;
         }
         if (retry >= 3) {
-            printf("rsf %d: FAIL at %d with %X\n", rsf, j, seeds[j]);
+            printf("rsf %d: FAIL at %d with %"PRIX32"\n", rsf, j, seeds[j]);
             return 1;
         }
     }

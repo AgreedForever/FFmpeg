@@ -20,6 +20,8 @@
  */
 
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "voc.h"
 #include "libavutil/intreadwrite.h"
@@ -43,7 +45,7 @@ typedef struct C93DemuxContext {
     AVStream *audio;
 } C93DemuxContext;
 
-static int probe(AVProbeData *p)
+static int probe(const AVProbeData *p)
 {
     int i;
     int index = 1;
@@ -156,24 +158,21 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     pkt->data[0] = 0;
     pkt->size = datasize + 1;
 
-    ret = avio_read(pb, pkt->data + 1, datasize);
-    if (ret < datasize) {
-        ret = AVERROR(EIO);
-        goto fail;
+    ret = ffio_read_size(pb, pkt->data + 1, datasize);
+    if (ret < 0) {
+        return ret;
     }
 
     datasize = avio_rl16(pb); /* palette size */
     if (datasize) {
         if (datasize != 768) {
             av_log(s, AV_LOG_ERROR, "invalid palette size %u\n", datasize);
-            ret = AVERROR_INVALIDDATA;
-            goto fail;
+            return AVERROR_INVALIDDATA;
         }
         pkt->data[0] |= C93_HAS_PALETTE;
-        ret = avio_read(pb, pkt->data + pkt->size, datasize);
-        if (ret < datasize) {
-            ret = AVERROR(EIO);
-            goto fail;
+        ret = ffio_read_size(pb, pkt->data + pkt->size, datasize);
+        if (ret < 0) {
+            return ret;
         }
         pkt->size += 768;
     }
@@ -186,15 +185,11 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
         pkt->data[0] |= C93_FIRST_FRAME;
     }
     return 0;
-
-    fail:
-    av_packet_unref(pkt);
-    return ret;
 }
 
-AVInputFormat ff_c93_demuxer = {
-    .name           = "c93",
-    .long_name      = NULL_IF_CONFIG_SMALL("Interplay C93"),
+const FFInputFormat ff_c93_demuxer = {
+    .p.name         = "c93",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Interplay C93"),
     .priv_data_size = sizeof(C93DemuxContext),
     .read_probe     = probe,
     .read_header    = read_header,
